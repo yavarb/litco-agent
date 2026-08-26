@@ -3398,11 +3398,17 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # lock file) behind; every later fetch then fails with "File exists" and
     # the check reports a hard failure (or, in the banner path, silently
     # compares stale refs). Self-heal abandoned locks before fetching.
-    from hermes_cli.gitlock import clear_stale_git_locks
+    from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
 
     cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
     for lock_path in cleared:
         print(f"  (removed stale git lock: {lock_path})")
+    # Aborted fetches on flaky lines also strand tmp_pack_* debris in
+    # .git/objects/pack — unchecked it reached 6 GB and corrupted the pack
+    # dir outright (#93732). Same age+process safety contract as the locks.
+    swept = clear_stale_tmp_packs(_m().PROJECT_ROOT)
+    if swept:
+        print(f"  (removed {len(swept)} aborted-fetch pack temp file(s))")
 
     # Fetch only the branch we compare against; prefer upstream as the canonical
     # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
@@ -5027,6 +5033,173 @@ def _desktop_owns_gateway_lifecycle() -> bool:
     return False
 
 
+def _stop_windows_gateway_service(
+    name: str,
+    *,
+    expected_processes: tuple[tuple[int, float], ...] = (),
+    expected_service_identity: tuple[int, float] | None = None,
+    expected_gateway_identity: tuple[int, float] | None = None,
+    timeout: float = 30.0,
+) -> None:
+    """Stop one verified Windows service and wait until SCM reports it down."""
+    import psutil  # noqa: PLC0415
+
+    service = psutil.win_service_get(name)
+    if expected_service_identity is not None:
+        try:
+            current_status = str(service.status())
+            current_service_pid = int(service.pid() or 0)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Windows service {name} SCM identity is unavailable before stop"
+            ) from exc
+        if current_status != "running":
+            raise RuntimeError(
+                f"Windows service {name} is not stably running before stop: {current_status}"
+            )
+        if current_service_pid != int(expected_service_identity[0]):
+            raise RuntimeError(
+                f"Windows service {name} SCM process identity changed before stop"
+            )
+    for label, identity in (
+        ("service", expected_service_identity),
+        ("gateway", expected_gateway_identity),
+    ):
+        if identity is None:
+            continue
+        pid, create_time = identity
+        try:
+            current = float(psutil.Process(int(pid)).create_time())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Windows {label} process identity is unavailable before stop"
+            ) from exc
+        if abs(current - float(create_time)) > 0.001:
+            raise RuntimeError(
+                f"Windows {label} process identity changed before stop"
+            )
+    if expected_service_identity is not None and expected_gateway_identity is not None:
+        service_pid = int(expected_service_identity[0])
+        gateway_pid = int(expected_gateway_identity[0])
+        try:
+            ancestor_pids = {
+                int(parent.pid) for parent in psutil.Process(gateway_pid).parents()
+            }
+        except Exception as exc:
+            raise RuntimeError(
+                "Windows gateway ancestry is unavailable before service stop"
+            ) from exc
+        if service_pid not in ancestor_pids:
+            raise RuntimeError(
+                f"Windows gateway is no longer owned by service {name}"
+            )
+    result = subprocess.run(
+        ["sc.exe", "stop", name],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 and service.status() != "stopped":
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or f"sc.exe stop failed with {result.returncode}")
+
+    def _original_process_is_alive(pid: int, create_time: float) -> bool:
+        try:
+            current = float(psutil.Process(pid).create_time())
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            # A vanished process is clear.
+            return False
+        except Exception:
+            # AccessDenied or any unknown probe failure stays fail-closed
+            # because the venv may still be locked.
+            return True
+        return abs(current - create_time) <= 0.001
+
+    alive = [
+        pid
+        for pid, create_time in expected_processes
+        if _original_process_is_alive(pid, create_time)
+    ]
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        service_stopped = service.status() == "stopped"
+        alive = [
+            pid
+            for pid, create_time in expected_processes
+            if _original_process_is_alive(pid, create_time)
+        ]
+        if service_stopped and not alive:
+            return
+        _time.sleep(0.2)
+    if service.status() == "stopped":
+        # We only return if the original processes have also exited their identity.
+        # A lingering process with a matching creation time means the venv mutation
+        # must not proceed — fail closed.
+        alive_after_stop = [
+            pid
+            for pid, create_time in expected_processes
+            if _original_process_is_alive(pid, create_time)
+        ]
+        if alive_after_stop:
+            raise RuntimeError(
+                f"Windows service {name} stopped but its process tree is still alive: "
+                f"{alive_after_stop}"
+            )
+        return
+    # If we reach here, the timeout elapsed without the service reaching a stable stopped state
+    # while its original descendants are still alive. Fail closed — venv mutation is unsafe.
+    raise RuntimeError(
+        f"Windows service {name} did not stop within {timeout:.0f}s; venv mutation unsafe."
+    )
+
+
+def _start_windows_gateway_service(name: str, *, timeout: float = 30.0) -> None:
+    """Start one previously paused Windows service and verify it is running."""
+    import psutil  # noqa: PLC0415
+
+    service = psutil.win_service_get(name)
+    result = subprocess.run(
+        ["sc.exe", "start", name],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 and service.status() != "running":
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or f"sc.exe start failed with {result.returncode}")
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if service.status() == "running":
+            return
+        _time.sleep(0.2)
+    raise RuntimeError(f"Windows service {name} did not start within {timeout:.0f}s")
+
+
+def _restore_windows_gateway_service(name: str, *, timeout: float = 60.0) -> None:
+    """Restore a service after an uncertain stop, including STOP_PENDING."""
+    import psutil  # noqa: PLC0415
+
+    service = psutil.win_service_get(name)
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        status = service.status()
+        if status == "running":
+            return
+        if status == "stopped":
+            _start_windows_gateway_service(name)
+            return
+        _time.sleep(0.2)
+    raise RuntimeError(
+        f"Windows service {name} did not reach a restorable state within {timeout:.0f}s"
+    )
+
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -5045,16 +5218,45 @@ def _pause_windows_gateways_for_update() -> dict | None:
             _get_restart_drain_timeout,
             find_gateway_pids,
             find_profile_gateway_processes,
+            find_windows_gateway_services,
         )
     except Exception as exc:
-        logger.debug("Could not prepare Windows gateway pause for update: %s", exc)
-        return None
+        raise RuntimeError(
+            f"Could not prepare Windows gateway pause for update: {exc}"
+        ) from exc
 
     try:
-        running_pids = list(dict.fromkeys(find_gateway_pids(all_profiles=True)))
+        profile_process_list = find_profile_gateway_processes(strict=True)
+        profile_processes = {proc.pid: proc for proc in profile_process_list}
     except Exception as exc:
-        logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
-        return None
+        raise RuntimeError(
+            f"Could not map Windows gateway PIDs to profiles: {exc}"
+        ) from exc
+
+    try:
+        service_gateways = find_windows_gateway_services(
+            profile_processes=profile_process_list
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not determine Windows gateway service ownership: {exc}"
+        ) from exc
+
+    service_gateway_pids = {int(service.gateway_pid) for service in service_gateways}
+    try:
+        running_pids = list(
+            dict.fromkeys(
+                [
+                    *find_gateway_pids(all_profiles=True),
+                    *sorted(profile_processes),
+                    *sorted(service_gateway_pids),
+                ]
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not discover Windows gateway PIDs before update: {exc}"
+        ) from exc
     if not running_pids:
         # No gateway is running right now, but the user may have installed an
         # autostart entry (Scheduled Task or Startup-folder login item) — that
@@ -5101,18 +5303,12 @@ def _pause_windows_gateways_for_update() -> dict | None:
             )
         return None
 
-    profile_processes = {}
-    try:
-        profile_processes = {
-            proc.pid: proc for proc in find_profile_gateway_processes()
-        }
-    except Exception as exc:
-        logger.debug("Could not map Windows gateway PIDs to profiles: %s", exc)
-
     profiles: dict[str, int] = {}
     mapped_pids = []
     socket_acks: list[dict] = []
     for pid in running_pids:
+        if pid in service_gateway_pids:
+            continue
         proc = profile_processes.get(pid)
         if proc is None:
             continue
@@ -5177,7 +5373,11 @@ def _pause_windows_gateways_for_update() -> dict | None:
         mapped_pids,
         timeout=drain_timeout,
     )
-    unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+    unmapped_pids = [
+        pid
+        for pid in running_pids
+        if pid not in profile_processes and pid not in service_gateway_pids
+    ]
 
     # Snapshot each unmapped gateway's command line *before* we force-kill it,
     # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
@@ -5222,14 +5422,76 @@ def _pause_windows_gateways_for_update() -> dict | None:
             # denied, already gone): those still need a manual restart.
             print("    Restart manually after update: hermes gateway run")
 
-    return {
+    token = {
         "resume_needed": True,
         "profiles": profiles,
         "unmapped_pids": unmapped_pids,
         "unmapped": unmapped,
     }
 
-def _cold_start_windows_gateway_after_update() -> None:
+    # Stop SCM-supervised gateways only after every fallible preparation step
+    # for ordinary gateways is complete. From this point to return, any error
+    # restores both the attempted services and the already-paused ordinary
+    # gateways before aborting the update.
+    paused_services = []
+    current_service_name = None
+    try:
+        for service in service_gateways:
+            current_service_name = str(service.name)
+            _stop_windows_gateway_service(
+                current_service_name,
+                expected_processes=tuple(
+                    getattr(service, "descendant_identities", ())
+                ),
+                expected_service_identity=(
+                    int(service.service_pid),
+                    float(service.service_create_time),
+                ),
+                expected_gateway_identity=(
+                    int(service.gateway_pid),
+                    float(service.gateway_create_time),
+                ),
+            )
+            paused_services.append(current_service_name)
+            current_service_name = None
+        if paused_services:
+            token["services"] = paused_services
+            token["expected_services"] = list(paused_services)
+            token["restarted_services"] = []
+            token["service_profiles"] = {
+                str(service.name): str(service.profile)
+                for service in service_gateways
+                if str(service.name) in paused_services
+            }
+            print(
+                "  ✓ Paused Windows gateway service(s): "
+                + ", ".join(paused_services)
+            )
+        return token
+    except Exception as exc:
+        restore_names = []
+        if current_service_name:
+            restore_names.append(current_service_name)
+        restore_names.extend(reversed(paused_services))
+        rollback_failures = []
+        for service_name in dict.fromkeys(restore_names):
+            try:
+                _restore_windows_gateway_service(service_name)
+            except Exception as restore_exc:
+                rollback_failures.append(f"{service_name}: {restore_exc}")
+        if profiles or unmapped:
+            try:
+                _resume_windows_gateways_after_update(token)
+            except Exception as restore_exc:
+                rollback_failures.append(f"ordinary gateways: {restore_exc}")
+        failed_service = current_service_name or "unknown"
+        detail = f"Could not stop Windows gateway service {failed_service}: {exc}"
+        if rollback_failures:
+            detail += "; rollback failures: " + "; ".join(rollback_failures)
+        raise RuntimeError(detail) from exc
+
+
+def _cold_start_windows_gateway_after_update() -> bool:
     """Start a fresh detached gateway after update when one is installed but down.
 
     Invoked from ``_resume_windows_gateways_after_update`` for the
@@ -5252,45 +5514,57 @@ def _cold_start_windows_gateway_after_update() -> None:
     unconditionally from the returned PID.
     """
     if not _m()._is_windows():
-        return
+        return True
     try:
         from hermes_cli import gateway_windows
         from hermes_cli.gateway import find_gateway_pids
     except Exception as exc:
-        logger.debug("Could not load Windows gateway cold-start helpers: %s", exc)
-        return
+        raise RuntimeError(
+            f"Could not load Windows gateway cold-start helpers: {exc}"
+        ) from exc
 
     # Re-check liveness right before spawning — between pause and resume the
     # autostart entry may have already brought a gateway up, or a leftover
     # process may have re-registered. Don't double-start.
     try:
         if list(find_gateway_pids(all_profiles=True)):
-            return
+            return True
     except Exception as exc:
-        logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
-        return
+        raise RuntimeError(
+            f"Could not re-check gateway liveness before cold-start: {exc}"
+        ) from exc
 
     try:
         if _desktop_owns_gateway_lifecycle():
             logger.debug(
                 "Skipping Windows gateway cold-start: Desktop owns gateway lifecycle"
             )
-            return
+            return True
     except Exception as exc:
-        logger.debug(
-            "Could not re-check Desktop gateway-lifecycle ownership before cold-start: %s",
-            exc,
-        )
+        raise RuntimeError(
+            "Could not re-check Desktop gateway-lifecycle ownership before cold-start: "
+            f"{exc}"
+        ) from exc
 
     try:
         pid = gateway_windows._spawn_detached()
     except Exception as exc:
-        logger.debug("Could not cold-start Windows gateway after update: %s", exc)
-        return
+        raise RuntimeError(f"Could not cold-start Windows gateway after update: {exc}") from exc
 
-    if pid:
-        print()
-        gateway_windows._report_gateway_start(f"cold-start after update (PID {pid})")
+    if not pid:
+        raise RuntimeError("Windows gateway cold-start did not return a process ID")
+    ready_pids = gateway_windows._wait_for_gateway_ready()
+    if not ready_pids:
+        raise RuntimeError(
+            f"Windows gateway cold-start PID {pid} did not become ready"
+        )
+    print()
+    print(
+        "✓ Gateway started via cold-start after update "
+        f"(PID: {', '.join(map(str, ready_pids))})"
+    )
+    return True
+
 
 def _for_each_systemd_gateway_unit(
     list_units_stdout: str,
@@ -5582,6 +5856,263 @@ def _surviving_gateway_pids_after_failed_restart():
         logger.debug("Could not probe for surviving gateways after update: %s", exc)
         return None
 
+
+_FRESH_RESTART_SUPERVISORS = frozenset({"systemd", "launchd", "service", "s6"})
+
+
+def _gateway_service_matches_profile(profile: str, service: object) -> bool:
+    """Match an exact gateway service/label to a profile.
+
+    Profile names must not be matched as substrings: ``foo`` must not claim
+    that ``hermes-gateway-foobar.service`` was already restarted.  These are
+    the service/label shapes produced by the existing systemd, launchd, and
+    s6 lifecycle implementations.
+    """
+    name = str(service).removesuffix(".service")
+    if profile == "default":
+        return name in {
+            "hermes-gateway",
+            "ai.hermes.gateway",
+            "gateway",
+            "gateway-default",
+        }
+    return name in {
+        f"hermes-gateway-{profile}",
+        f"ai.hermes.gateway-{profile}",
+        f"gateway-{profile}",
+    }
+
+
+def _gateway_recovery_partition(
+    plan, *, skip_profiles: set[str] | None = None
+) -> tuple[dict[str, str], list[dict]]:
+    """Partition pre-update runtimes into fresh-restart candidates and skips.
+
+    The update inventory is captured before the checkout changes.  It is the
+    only safe source here: re-importing ``hermes_cli.gateway`` in the failing
+    interpreter is exactly what can raise the original ``ImportError``.
+
+    Returns ``(candidates, skipped)`` where ``candidates`` maps profile →
+    supervisor for supervised gateway runtimes the fresh process may restart,
+    and ``skipped`` lists every other inventoried runtime the recovery pass
+    deliberately does NOT touch, each with an explicit reason.  Nothing from
+    the spawn ledger may vanish from the recovery pass silently: manual
+    gateways have no relaunch authority, and serve/dashboard runtimes (the
+    ``update_inventory`` serve collector) are owned by the Desktop app or a
+    human terminal, not by this recovery boundary.
+    """
+    skip_profiles = skip_profiles or set()
+    candidates: dict[str, str] = {}
+    skipped: list[dict] = []
+    try:
+        for runtime in getattr(plan, "runtimes", ()) or ():
+            kind = getattr(runtime, "kind", None)
+            profile = getattr(runtime, "profile", None)
+            supervisor = getattr(runtime, "supervisor", None)
+            if not isinstance(profile, str) or not profile:
+                continue
+            if kind == "gateway":
+                if profile in skip_profiles:
+                    continue
+                if supervisor in _FRESH_RESTART_SUPERVISORS:
+                    candidates.setdefault(profile, str(supervisor))
+                else:
+                    skipped.append(
+                        {
+                            "profile": profile,
+                            "kind": "gateway",
+                            "supervisor": str(supervisor),
+                            "reason": (
+                                "manual gateway has no supervisor relaunch"
+                                " authority; left running for explicit operator"
+                                " restart"
+                            ),
+                        }
+                    )
+            elif kind in ("serve", "dashboard"):
+                if supervisor == "desktop":
+                    reason = (
+                        "desktop app owns and respawns this serve backend;"
+                        " the recovery pass must not restart it out from under"
+                        " its supervisor"
+                    )
+                else:
+                    reason = (
+                        "manually launched serve/dashboard has no relaunch"
+                        " authority; left running for explicit operator"
+                        " restart"
+                    )
+                skipped.append(
+                    {
+                        "profile": profile,
+                        "kind": str(kind),
+                        "supervisor": str(supervisor),
+                        "reason": reason,
+                    }
+                )
+    except Exception as exc:
+        logger.debug("Could not prepare fresh gateway restart profiles: %s", exc)
+    return candidates, skipped
+
+
+def _gateway_restart_recovery_profiles(
+    plan, *, skip_profiles: set[str] | None = None
+) -> list[str]:
+    """Return supervised gateway profiles that a fresh process may restart."""
+    candidates, _ = _gateway_recovery_partition(plan, skip_profiles=skip_profiles)
+    return sorted(candidates)
+
+
+def _recover_gateway_restart_after_abort(
+    plan, *, gateway_mode: bool, skip_profiles: set[str] | None = None
+) -> dict[str, list]:
+    """Retry supervised gateway restarts from a clean Python process.
+
+    ``hermes update`` normally performs the fleet restart in the interpreter
+    that started before ``git pull``.  If that phase raises while importing the
+    new tree, a warning alone leaves the old gateway alive against new files on
+    disk.  The recovery boundary launches the existing per-profile
+    ``gateway restart`` command through a new interpreter, preserving its
+    platform-specific drain and service-manager logic without inheriting the
+    stale ``sys.modules`` graph.
+
+    Only profiles classified as supervisor-owned by the pre-update inventory
+    are handed off.  A manual gateway must remain running and be reported for
+    explicit operator action rather than being killed without a relaunch
+    authority; serve/dashboard runtimes from the spawn ledger are likewise
+    recorded as skipped with a reason instead of vanishing from the pass.
+    The returned protocol is persisted in the update receipt so operators can
+    distinguish a spawn failure from a per-profile failure.
+
+    Outcome honesty: ``verified`` means the fresh child independently observed
+    the profile's systemd unit active after the relaunch.  A zero exit from
+    ``gateway restart`` alone is NOT observed proof that the new code
+    generation is serving, so those outcomes are reported as
+    ``relaunch_attempted`` and never claim supervisor coverage.
+    """
+    candidates, skipped = _gateway_recovery_partition(
+        plan, skip_profiles=skip_profiles
+    )
+    profiles = sorted(candidates)
+    if not profiles:
+        return {
+            "requested": [],
+            "verified": [],
+            "relaunch_attempted": [],
+            "failed": [],
+            "skipped": skipped,
+        }
+
+    def _all_failed() -> dict[str, list]:
+        return {
+            "requested": profiles,
+            "verified": [],
+            "relaunch_attempted": [],
+            "failed": profiles,
+            "skipped": skipped,
+        }
+
+    command = [
+        sys.executable,
+        "-m",
+        "hermes_cli.update_restart_recovery",
+        "--stdin",
+    ]
+    env = os.environ.copy()
+    env["HERMES_UPDATE_RESTART_RECOVERY"] = "1"
+    for marker in ("_HERMES_GATEWAY", "HERMES_GATEWAY", "HERMES_GATEWAY_MODE"):
+        env.pop(marker, None)
+
+    # A gateway-triggered update may run inside the gateway's systemd cgroup.
+    # Put the recovery process in a transient user scope before it asks systemd
+    # to restart that gateway, otherwise KillMode can terminate the recovery
+    # process together with the old service. If systemd-run is unavailable,
+    # fail closed rather than pretending the in-cgroup child is independent.
+    if gateway_mode and sys.platform == "linux":
+        systemd_run = shutil.which("systemd-run")
+        if not systemd_run:
+            logger.warning("Cannot isolate fresh gateway recovery from the gateway cgroup")
+            return _all_failed()
+        command = [
+            systemd_run,
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--",
+            *command,
+        ]
+
+    kwargs = {
+        "input": json.dumps({"profiles": profiles, "supervisors": candidates}),
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "check": False,
+        "env": env,
+        "timeout": max(120, 30 + 90 * len(profiles)),
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        result = subprocess.run(command, **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Fresh gateway restart recovery failed: %s", exc)
+        return _all_failed()
+
+    if result.returncode != 0:
+        logger.warning("Fresh gateway restart recovery exited %s", result.returncode)
+        return _all_failed()
+
+    try:
+        recovery_result = json.loads(result.stdout or "")
+        verified = recovery_result.get("verified")
+        relaunch_attempted = recovery_result.get("relaunch_attempted")
+        failed = recovery_result.get("failed")
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("Fresh gateway restart recovery returned invalid JSON")
+        return _all_failed()
+
+    buckets = (verified, relaunch_attempted, failed)
+    reported: list[str] = []
+    if all(isinstance(bucket, list) for bucket in buckets):
+        reported = [*verified, *relaunch_attempted, *failed]
+    if (
+        not all(isinstance(bucket, list) for bucket in buckets)
+        or any(not isinstance(profile, str) for profile in reported)
+        or set(reported) != set(profiles)
+        or len(reported) != len(set(reported))
+    ):
+        logger.warning("Fresh gateway restart recovery returned incomplete profiles")
+        return _all_failed()
+
+    if verified:
+        print(
+            "  ✓ Restarted supervised gateway(s) in a fresh process"
+            " (systemd-verified active): " + ", ".join(sorted(verified))
+        )
+    if relaunch_attempted:
+        print(
+            "  ⚠ Relaunch attempted in a fresh process but not"
+            " supervisor-verified (check these gateways manually): "
+            + ", ".join(sorted(relaunch_attempted))
+        )
+    return {
+        "requested": profiles,
+        "verified": sorted(verified),
+        "relaunch_attempted": sorted(relaunch_attempted),
+        "failed": sorted(failed),
+        "skipped": skipped,
+    }
+
+
 def _warn_gateway_restart_phase_aborted(exc: BaseException, pids) -> None:
     """Print a recovery warning when the whole restart phase raised.
 
@@ -5716,21 +6247,60 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
         return
-    token["resume_needed"] = False
     if not _m()._is_windows():
+        token["resume_needed"] = False
         return
 
     # Regenerate the persisted launcher scripts before respawning anything,
     # so a legacy pythonw-era Scheduled Task / Startup entry comes back on
-    # the current hidden-console design at the next login too.
+    # current hidden-console design at the next login too.
     _m()._refresh_windows_gateway_launchers()
+
+    services = list(token.get("services") or [])
+    token.setdefault("expected_services", list(services))
+    verified_restarts = list(token.get("restarted_services") or [])
+    restarted_services = []
+    failed_services = []
+    for service_name in services:
+        try:
+            _start_windows_gateway_service(str(service_name))
+            restarted_services.append(str(service_name))
+            if str(service_name) not in verified_restarts:
+                verified_restarts.append(str(service_name))
+        except Exception as exc:
+            logger.warning(
+                "Could not restart Windows gateway service %s after update: %s",
+                service_name,
+                exc,
+            )
+            print(f"  ⚠ Could not restart Windows gateway service: {service_name}")
+            failed_services.append(str(service_name))
+
+    if failed_services:
+        token["services"] = failed_services
+        token["restarted_services"] = verified_restarts
+        raise RuntimeError(
+            "Could not restart Windows gateway service(s): "
+            + ", ".join(failed_services)
+        )
+    token["services"] = []
+    token["restarted_services"] = verified_restarts
+    if restarted_services:
+        print()
+        print(
+            "  ✓ Restarted Windows gateway service(s): "
+            + ", ".join(restarted_services)
+        )
 
     profiles = token.get("profiles") or {}
     unmapped = token.get("unmapped") or []
     cold_start = bool(token.get("cold_start_if_installed"))
     if not profiles and not any(u.get("argv") for u in unmapped):
         if cold_start:
-            _m()._cold_start_windows_gateway_after_update()
+            if not _m()._cold_start_windows_gateway_after_update():
+                raise RuntimeError("Windows gateway cold-start was not verified")
+            token["cold_start_if_installed"] = False
+        token["resume_needed"] = False
         return
 
     try:
@@ -5739,38 +6309,68 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
             launch_detached_profile_gateway_restart,
         )
     except Exception as exc:
-        logger.debug("Could not load Windows gateway restart helper: %s", exc)
-        return
+        raise RuntimeError(
+            f"Could not load Windows gateway restart helper: {exc}"
+        ) from exc
 
     relaunched = []
+    failed_profiles = {}
     for profile, old_pid in sorted(profiles.items()):
         try:
             if launch_detached_profile_gateway_restart(str(profile), int(old_pid)):
                 relaunched.append(str(profile))
+            else:
+                failed_profiles[str(profile)] = int(old_pid)
         except Exception as exc:
             logger.debug(
                 "Could not restart Windows gateway profile %s after update: %s",
                 profile,
                 exc,
             )
+            failed_profiles[str(profile)] = int(old_pid)
+
+    # Surface the outcome on the token (#91277 Phase 2 plan-vs-execution
+    # reconciliation): the git-based update path's fleet reconciliation
+    # cross-checks every planned runtime against restarted_services /
+    # relaunched_profiles / externally_supervised_profiles / killed_pids —
+    # bookkeeping this Windows-specific pause/resume never fed, so a
+    # correctly-paused-and-relaunched Windows gateway was reported
+    # "unaccounted" (loud warning + exit 1) even though the restart
+    # succeeded. The caller merges this into the shared
+    # relaunched_profiles list before reconciliation runs. A profile whose
+    # relaunch genuinely failed is deliberately left off this list — it
+    # must still surface as unaccounted so the user is told to restart it
+    # manually (Windows has no watcher to recover a failed relaunch).
+    token["relaunched_profiles"] = relaunched
 
     # Respawn unmapped gateways (no profile→PID-file mapping, e.g. a Scheduled
     # Task) by replaying the argv we snapshotted before force-killing them.
     unmapped_relaunched = 0
+    failed_unmapped = []
     for entry in unmapped:
         argv = entry.get("argv")
         old_pid = entry.get("pid")
         if not argv or not old_pid:
+            failed_unmapped.append(entry)
             continue
         try:
             if launch_detached_gateway_restart_by_cmdline(int(old_pid), list(argv)):
                 unmapped_relaunched += 1
+            else:
+                failed_unmapped.append(entry)
         except Exception as exc:
             logger.debug(
                 "Could not restart unmapped Windows gateway (pid %s) after update: %s",
                 old_pid,
                 exc,
             )
+            failed_unmapped.append(entry)
+
+    token["profiles"] = failed_profiles
+    token["unmapped"] = failed_unmapped
+    if failed_profiles or failed_unmapped:
+        raise RuntimeError("Could not restart every paused Windows gateway")
+    token["resume_needed"] = False
 
     if relaunched:
         print()
@@ -6425,11 +7025,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # crashed fetch) before the fetch — otherwise the update fails with
         # "Unable to create .../shallow.lock: File exists" and never reaches
         # the network.
-        from hermes_cli.gitlock import clear_stale_git_locks
+        from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
 
         cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
         if cleared:
             print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
+        swept = clear_stale_tmp_packs(_m().PROJECT_ROOT)
+        if swept:
+            print("  (removed %d aborted-fetch pack temp file(s))" % len(swept))
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
@@ -7807,6 +8410,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _write_gateway_update_exit_code(desktop_build_ok)
 
         gateway_fleet_restart_incomplete = False
+        gateway_restart_phase_errors: list[str] = []
         # Snapshot of gateways running before we touch anything. Stays empty
         # until we successfully import the probe and are about to stop/drain —
         # so an exception raised before we touch any gateway keeps this empty
@@ -7820,6 +8424,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # needed to forward already-restarted units to
         # ``_finish_dashboard_update_cleanup`` (review on #83595).
         restarted_services: list = []
+        # Keep these restart bookkeeping collections defined even when the
+        # phase raises before its platform-specific imports initialize them.
+        # The abort recovery and the fleet reconciliation both consume the
+        # pre-update plan in that early-failure shape.
+        failed_or_stale_units: list = []
+        relaunched_profiles: list = []
+        externally_supervised_profiles: list = []
         # Same outside-the-try treatment: the post-restart fleet version
         # check consults killed_pids to decide whether to wait for
         # freshly-restarted gateways to settle, and the phase's except
@@ -8578,6 +9189,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
+            gateway_restart_phase_errors.append(str(e))
             # An exception escaping the whole phase means the drain/restart
             # output the user relies on never printed. Don't let that pass for
             # a clean update: surface it and treat the fleet as stale unless we
@@ -8589,7 +9201,57 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # its replacement was never verified — the same fail-open contract
             # this fix closes — so we must still fail closed on ``[]``.
             _surviving = _surviving_gateway_pids_after_failed_restart()
-            if _restart_phase_failure_is_incomplete(
+            _already_restarted_profiles = set(relaunched_profiles)
+            _already_restarted_profiles.update(externally_supervised_profiles)
+            for runtime in getattr(_pre_update_plan, "runtimes", ()) or ():
+                if getattr(runtime, "kind", None) != "gateway":
+                    continue
+                profile = getattr(runtime, "profile", None)
+                if not isinstance(profile, str):
+                    continue
+                if any(
+                    _gateway_service_matches_profile(profile, service)
+                    for service in restarted_services
+                ):
+                    _already_restarted_profiles.add(profile)
+            _recovery_result = _recover_gateway_restart_after_abort(
+                _pre_update_plan,
+                gateway_mode=gateway_mode,
+                skip_profiles=_already_restarted_profiles,
+            )
+            # Only systemd-VERIFIED outcomes may claim supervisor coverage.
+            # A relaunch that merely exited 0 ("relaunch_attempted") was never
+            # observed by the code and must not clear the incomplete flag.
+            _recovery_verified = set(_recovery_result.get("verified") or [])
+            if _recovery_verified:
+                relaunched_profiles.extend(
+                    profile
+                    for profile in sorted(_recovery_verified)
+                    if profile not in relaunched_profiles
+                )
+            _planned_gateway_runtimes = [
+                runtime
+                for runtime in getattr(_pre_update_plan, "runtimes", ()) or ()
+                if getattr(runtime, "kind", None) == "gateway"
+                and isinstance(getattr(runtime, "profile", None), str)
+            ]
+            _planned_gateway_profiles = {
+                runtime.profile for runtime in _planned_gateway_runtimes
+            }
+            _covered_gateway_profiles = (
+                _already_restarted_profiles | _recovery_verified
+            )
+            _recovery_complete = bool(_planned_gateway_profiles) and (
+                _planned_gateway_profiles <= _covered_gateway_profiles
+                and not _recovery_result.get("failed")
+                and not _recovery_result.get("relaunch_attempted")
+            )
+            if _recovery_complete:
+                # The fresh child is the recovery terminal result. Leave the
+                # final fleet-version matrix below as the authoritative
+                # read-back before the update is declared successful.
+                gateway_fleet_restart_incomplete = False
+            elif _restart_phase_failure_is_incomplete(
                 _surviving, _pre_restart_gateway_pids
             ):
                 gateway_fleet_restart_incomplete = True
@@ -8605,13 +9267,89 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                 record_gateway_restart(
                     restarted_services=restarted_services,
+                    relaunched_profiles=relaunched_profiles,
+                    externally_supervised_profiles=externally_supervised_profiles,
+                    killed_pids=sorted(killed_pids),
+                    failed_units=failed_or_stale_units,
                     incomplete=gateway_fleet_restart_incomplete,
                     phase_error=str(e),
+                    fresh_recovery=_recovery_result,
                 )
             except Exception:
                 pass
 
-        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        try:
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        except Exception as _windows_resume_exc:
+            gateway_fleet_restart_incomplete = True
+            gateway_restart_phase_errors.append(str(_windows_resume_exc))
+            print(
+                "  ⚠ Windows gateway service restart incomplete: "
+                f"{_windows_resume_exc}"
+            )
+            if gateway_mode:
+                _exit_code_path = get_hermes_home() / ".update_exit_code"
+                try:
+                    _exit_code_path.write_text("1", encoding="utf-8")
+                except OSError:
+                    pass
+
+        if isinstance(_windows_gateway_resume, dict):
+            # Feed Windows's own pause/resume outcome into the same
+            # relaunched_profiles bookkeeping the systemd/launchd restart
+            # phase populates, so the #91277 Phase 2 reconciliation below
+            # does not report a correctly-relaunched Windows gateway as
+            # "unaccounted" (a runtime the plan saw but no bookkeeping
+            # mentions — the reconciliation's blind-spot tripwire). A
+            # profile whose relaunch genuinely failed is intentionally
+            # left out of the token's list, so it still surfaces there.
+            # Best-effort: the restart-phase try/except above may have
+            # raised before relaunched_profiles was initialized, so this
+            # must never itself abort the update.
+            try:
+                for _win_profile in _windows_gateway_resume.get("relaunched_profiles") or []:
+                    if _win_profile not in relaunched_profiles:
+                        relaunched_profiles.append(_win_profile)
+            except Exception as _win_reconcile_exc:
+                logger.debug(
+                    "Could not merge Windows relaunch outcome into fleet "
+                    "reconciliation bookkeeping: %s",
+                    _win_reconcile_exc,
+                )
+            windows_restarted = list(
+                _windows_gateway_resume.get("restarted_services") or []
+            )
+            for service_name in windows_restarted:
+                if service_name not in restarted_services:
+                    restarted_services.append(service_name)
+            service_profiles = _windows_gateway_resume.get("service_profiles") or {}
+            for service_name in windows_restarted:
+                profile_name = service_profiles.get(service_name)
+                if profile_name and profile_name not in relaunched_profiles:
+                    relaunched_profiles.append(profile_name)
+            pending_services = list(_windows_gateway_resume.get("services") or [])
+            for service_name in pending_services:
+                label = str(service_profiles.get(service_name) or service_name)
+                if label not in failed_or_stale_units:
+                    failed_or_stale_units.append(label)
+
+            try:
+                from hermes_cli.update_receipt import record_gateway_restart
+
+                record_gateway_restart(
+                    restarted_services=restarted_services,
+                    relaunched_profiles=relaunched_profiles,
+                    externally_supervised_profiles=externally_supervised_profiles,
+                    killed_pids=sorted(killed_pids),
+                    failed_units=failed_or_stale_units,
+                    incomplete=(
+                        gateway_fleet_restart_incomplete
+                        or bool(failed_or_stale_units)
+                    ),
+                    phase_error="; ".join(gateway_restart_phase_errors) or None,
+                )
+            except Exception:
+                pass
 
         # Warn if legacy Hermes gateway unit files are still installed.
         # When both hermes.service (from a pre-rename install) and the
@@ -8907,6 +9645,8 @@ def _fleet_probe_expected_runtimes(
     if isinstance(windows_resume_token, dict) and (
         windows_resume_token.get("profiles")
         or windows_resume_token.get("unmapped")
+        or windows_resume_token.get("services")
+        or windows_resume_token.get("expected_services")
     ):
         return True
     return False
