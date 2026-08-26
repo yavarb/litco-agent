@@ -15,10 +15,17 @@ jobs:
         run: pip install pytest pyyaml psutil
       - name: Watchdog + pipe-drain suites (head)
         run: python -m pytest tests/test_desktop_update_windows_pipe_drain.py tests/test_desktop_update_windows_python_handoff.py tests/test_desktop_update_windows_progress.py tests/test_desktop_update_windows_timestamp.py -q --tb=short
-      - name: Self-test fixture — silent stalled child is terminated (exit 124, no survivors)
+      - name: Self-test fixture — pipe-drain leak + flood arms (fixture defaults)
         shell: pwsh
+        timeout-minutes: 8
         run: |
-          $env:HERMES_UPDATE_STEP_IDLE_SECONDS = "5"
+          # No HERMES_UPDATE_STEP_IDLE_SECONDS override: the fixture's leak arm
+          # intentionally runs a 60s-hold grandchild against a 20s drain-abandon
+          # window; a 5s external idle ceiling made the WATCHDOG cancel the
+          # fixture that was busy proving the DRAIN — the first lane attempt
+          # wedged exactly there. Shorten the hold instead, and let the step
+          # watchdog run at its shipped default.
+          $env:HERMES_SELFTEST_HOLD_SECONDS = "30"
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-update/windows.ps1 -SelfTestPipeDrain
           if ($LASTEXITCODE -ne 0) { throw "self-test failed rc=$LASTEXITCODE" }
       - name: Default is 600s (Teknium adjustment pinned)
