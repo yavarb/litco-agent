@@ -1,0 +1,19 @@
+name: proof-95897-tier1
+on:
+  push:
+    branches:
+      - proof/95897-tier1
+permissions:
+  contents: read
+jobs:
+  selftest-pipe-drain:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run -SelfTestPipeDrain
+        shell: cmd
+        env:
+          HERMES_UPDATE_STEP_IDLE_SECONDS: '20'
+          HERMES_SELFTEST_HOLD_SECONDS: '60'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-update/windows.ps1 -SelfTestPipeDrain
