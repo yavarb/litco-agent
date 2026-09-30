@@ -46,7 +46,7 @@
 #   /opt/litco-agent/current -> releases/<ref>   flipped by litco-host-update
 #   /srv/litco/m/<slot>                    each slot's home (made by the supervisor)
 #   /etc/systemd/system/litco-agent@.service, litco-supervisor.service
-#   /usr/local/bin/litco-supervisor, /usr/local/sbin/litco-host-update
+#   /usr/local/sbin/litco-supervisor, /usr/local/sbin/litco-host-update
 #   /etc/nftables.conf                     inbound only on tailscale0
 
 set -euo pipefail
@@ -261,7 +261,7 @@ if machine; then
   # start one gateway for no matter.
   run rm -f /etc/systemd/system/litco-agent.service
   run install -m 0644 "$APP/deploy/host/litco-agent@.service" "/etc/systemd/system/litco-agent@.service"
-  run install -m 0755 "$APP/deploy/host/litco-supervisor" /usr/local/bin/litco-supervisor
+  run install -m 0755 "$APP/deploy/host/litco-supervisor" /usr/local/sbin/litco-supervisor
   run install -m 0644 "$APP/deploy/host/litco-supervisor.service" /etc/systemd/system/litco-supervisor.service
   run install -m 0755 "$APP/deploy/host/litco-host-update" /usr/local/sbin/litco-host-update
   # Slot homes are created 0700 by the supervisor; the parent only lets owners in.

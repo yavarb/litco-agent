@@ -61,7 +61,7 @@ _ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _PLAIN = re.compile(r"^[A-Za-z0-9._:/@+-]*$")
 # A slot id is the matter's short id: it names the Unix user m_<id>, so it stays
 # inside useradd's limits.
-_SLOT_ID = re.compile(r"^[a-z0-9]{1,24}$")
+_SLOT_ID = re.compile(r"^[a-z0-9]{1,30}$")
 SLOT_ROOT = Path("/srv/litco/m")
 _TOKEN = re.compile(r"\{\{(\w+)\}\}")
 

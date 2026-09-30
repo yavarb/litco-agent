@@ -90,7 +90,7 @@ def test_machine_installs_the_template_unit_supervisor_and_update_from_the_relea
     assert f"env -C {rel} UV_PROJECT_ENVIRONMENT={rel}/.venv uv sync --frozen --no-dev --extra messaging " \
            "--python <uv python find 3.14>" in cmds
     assert f"install -m 0644 {rel}/deploy/host/litco-agent@.service /etc/systemd/system/litco-agent@.service" in cmds
-    assert f"install -m 0755 {rel}/deploy/host/litco-supervisor /usr/local/bin/litco-supervisor" in cmds
+    assert f"install -m 0755 {rel}/deploy/host/litco-supervisor /usr/local/sbin/litco-supervisor" in cmds
     assert f"install -m 0644 {rel}/deploy/host/litco-supervisor.service " \
            "/etc/systemd/system/litco-supervisor.service" in cmds
     assert f"install -m 0755 {rel}/deploy/host/litco-host-update /usr/local/sbin/litco-host-update" in cmds
