@@ -619,7 +619,10 @@ def test_remember_defaults_to_a_kind_litkit_accepts(fake, env):
     fake.route("POST", r"/api/agent/actions", lambda r: (200, {"ok": True, "echo": r.json()}))
     out = call("litkit_remember", content="Jane Doe left Acme in March 2022")
     assert out["echo"]["args"] == {"kind": "fact", "content": "Jane Doe left Acme in March 2022"}
-    assert set(T.SCHEMAS["litkit_remember"]["parameters"]["properties"]["kind"]["enum"]) == set(T.REMEMBER_KINDS)
+    # kind has no enum: matter kinds and firm/person kinds differ, so the description names each set
+    # and the tool validates at call time.
+    desc = T.SCHEMAS["litkit_remember"]["parameters"]["properties"]["kind"]["description"]
+    assert all(k in desc for k in T.REMEMBER_KINDS)
 
 
 def test_remember_rejects_a_kind_litkit_would_refuse_before_any_request(fake, env):
