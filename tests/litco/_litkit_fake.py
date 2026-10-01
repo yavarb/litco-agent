@@ -155,7 +155,8 @@ class FakeReview:
 
     Launch follows the app's thread rule as a test sees it: LitKit, not the host, decides whether the
     person answered after the card. ``reply(proposal_id)`` records that they did; until then launch
-    answers ``409 no_reply_after_card``. ``launch_route = False`` makes the launch and withdraw routes
+    answers ``409 no_reply_after_card``. Launch needs the turn's grant (``X-LitKit-Turn-Grant``), as the app
+    requires. ``launch_route = False`` makes the launch and withdraw routes
     404 as an app that predates them does.
 
     Billing follows litkit-app's ``review_run``: with ``price_usd > 0``, a propose without a quoteId
@@ -330,6 +331,10 @@ class FakeReview:
                              "launched": self._launched(p)}}
 
     def _launch(self, p: Dict[str, Any], req: Recorded) -> Any:
+        # The app reads the post the turn answers from the turn grant it minted; it never takes the host's word.
+        if not req.headers.get("x-litkit-turn-grant"):
+            return 403, {"error": "turn_grant_required",
+                         "message": "A launch needs the turn grant LitKit sent with this turn."}
         body = req.json()
         if not isinstance(body, dict) or set(body) != {"threadId"}:
             return 400, {"error": "invalid input"}

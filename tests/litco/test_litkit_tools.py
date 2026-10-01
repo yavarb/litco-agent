@@ -738,7 +738,7 @@ THREAD = "7d0c6f2e-3a1b-4c5d-8e9f-0a1b2c3d4e5f"
 @pytest.fixture
 def in_thread(env):
     token = bind_turn(TurnIdentity(turn_id="turn_t", matter_id=M, acting_user=USER_ID, cwd=env["cwd"],
-                                   thread_id=THREAD))
+                                   thread_id=THREAD, turn_grant="grant.v1.team-thread"))
     yield THREAD
     reset_turn(token)
 
@@ -780,6 +780,7 @@ def test_launch_after_the_person_answers_starts_one_run(fake, in_thread):
     # The thread is the only thing the host says; no flag claims the person agreed.
     assert req.json() == {"threadId": THREAD}
     assert req.headers["x-litkit-acting-user"] == USER_ID and "x-litkit-user-assertion" in req.headers
+    assert req.headers["x-litkit-turn-grant"] == "grant.v1.team-thread"
     again = call("litkit_review", action="launch", proposalId=proposal_id)
     assert again["launched"] is True and again["alreadyLaunched"] is True and again["reviewJobId"] == job_id
     assert "already launched" in again["next"] and len(review.jobs) == 1
@@ -817,6 +818,9 @@ def test_a_full_review_runs_from_the_conversation_with_no_refused_call(fake, in_
     ("authorization_already_used", "one message launches one run"),
     ("not_this_thread", "proposed in another thread"),
     ("needs_reproposal", "Withdraw this proposal, propose again"),
+    ("needs_confirmation", "not a plain yes"),
+    ("later_reply_in_thread", "Someone wrote in the thread"),
+    ("ambiguous_proposal", "Withdraw the proposals you replaced"),
     ("not_a_launch_instruction", "Nothing changed. Their message did not tell you to launch."),
 ])
 def test_launch_refusals_carry_litkits_sentence(fake, in_thread, code, expect):
@@ -825,6 +829,41 @@ def test_launch_refusals_carry_litkits_sentence(fake, in_thread, code, expect):
     out = call("litkit_review", action="launch", proposalId=_id(5))
     assert "error" not in out and out["launched"] is False and out["refused"] == code
     assert out["message"] == message and expect in out["next"]
+
+
+def test_launch_passes_on_why_a_reply_was_not_a_plain_yes(fake, in_thread):
+    fake.route("POST", rf"/api/matters/{M}/proposals/{_id(5)}/launch", (409, {
+        "error": "needs_confirmation", "reason": "question", "message": "Not a plain yes."}))
+    out = call("litkit_review", action="launch", proposalId=_id(5))
+    assert out["refused"] == "needs_confirmation" and out["reason"] == "question" and out["launched"] is False
+
+
+def test_launch_reports_the_changed_count_when_litkit_asks_for_a_new_proposal(fake, in_thread):
+    fake.route("POST", rf"/api/matters/{M}/proposals/{_id(5)}/launch", (409, {
+        "error": "needs_reproposal", "message": "The documents changed (1234 then, 1300 now).",
+        "estimatedDocCount": 1234, "currentDocCount": 1300}))
+    out = call("litkit_review", action="launch", proposalId=_id(5))
+    assert out["launched"] is False and out["estimatedDocCount"] == 1234 and out["currentDocCount"] == 1300
+
+
+def test_launch_sends_the_turn_grant_only_when_the_turn_has_one(fake, env):
+    fake.route("POST", rf"/api/matters/{M}/proposals/{_id(5)}/launch", (409, {"error": "no_reply_after_card"}))
+    for grant in ("grant.v1.mac", None):
+        token = bind_turn(TurnIdentity(turn_id="t", matter_id=M, acting_user=USER_ID, cwd=env["cwd"],
+                                       thread_id=THREAD, turn_grant=grant))
+        try:
+            call("litkit_review", action="launch", proposalId=_id(5))
+        finally:
+            reset_turn(token)
+        assert fake.requests[-1].headers.get("x-litkit-turn-grant") == grant
+
+
+@pytest.mark.parametrize("code", ["turn_grant_required", "turn_grant_invalid", "turn_grant_expired"])
+def test_launch_without_a_usable_grant_is_an_instruction_not_a_permission_error(fake, in_thread, code):
+    fake.route("POST", rf"/api/matters/{M}/proposals/{_id(5)}/launch", (403, {"error": code, "message": "m"}))
+    out = call("litkit_review", action="launch", proposalId=_id(5))
+    assert out["launched"] is False and out["refused"] == code and "permission_denied" not in out
+    assert "launch in the turn that answers their yes" in out["next"]
 
 
 def test_launch_on_an_app_without_the_route_points_to_the_card(fake, in_thread):
@@ -1034,14 +1073,21 @@ def test_recall_without_a_lawyer_skips_person_notes(fake, env):
 CROSS = r"/api/agent/cross-matter-search"
 
 
-def _with_grant(env, grant="grant.v1.mac", acting=USER_ID):
+def _with_grant(env, grant="grant.v1.mac", acting=USER_ID, private=True):
     return bind_turn(TurnIdentity(turn_id="turn_1", matter_id=M, acting_user=acting, cwd=env["cwd"],
-                                  turn_grant=grant))
+                                  turn_grant=grant, private_thread=private))
 
 
 def test_cross_matter_search_without_a_grant_points_to_a_private_thread(fake, env):
     out = call("litkit_cross_matter_search", query="ZEBRA-7731")  # the env turn carries no grant
     assert out["available"] is False and "private thread" in out["message"]
+    # A shared thread's grant (kept for review launches) never reaches cross-matter search.
+    token = _with_grant(env, private=False)
+    try:
+        assert call("litkit_cross_matter_search", query="ZEBRA-7731")["available"] is False
+    finally:
+        reset_turn(token)
+    assert fake.requests == []
     token = _with_grant(env, acting=None)
     try:
         assert call("litkit_cross_matter_search", query="ZEBRA-7731")["available"] is False

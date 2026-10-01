@@ -27,7 +27,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from litco.homes import register_deliverable, safe_segment
 from litco.litkit.client import (TURN_GRANT_HEADER, LitKitClient, LitKitConfig, LitKitError,
                                  LitKitPermissionError, default_client)
-from litco.litkit.context import current_acting_user, current_thread_id, current_turn, current_turn_grant
+from litco.litkit.context import (current_acting_user, current_cross_matter_grant, current_thread_id, current_turn,
+                                  current_turn_grant)
 from litco.litkit.links import document_link, file_link, folder_link
 from litco.litkit.files import (TEXT_SEPARATOR, InputFileMissing, PathOutsideWorkDir, dumps, generate_preview,
                                 input_path, output_dir, output_path, relative, spill, work_dir)
@@ -980,9 +981,18 @@ LAUNCH_NOT_AVAILABLE = ("This LitKit cannot take a launch from the conversation 
                         "in this thread starts the run.")
 LAUNCH_ASK = ("Nothing launched. Ask the person, in one sentence, whether to launch this run, and call launch only "
               "after their answer in this thread says yes.")
+LAUNCH_NO_GRANT = ("Nothing launched. LitKit could not tie this launch to the person's message in this turn. Ask "
+                   "whether to launch, and launch in the turn that answers their yes.")
 LAUNCH_REFUSALS = {
     "no_reply_after_card": LAUNCH_ASK,
     "reply_from_another_person": LAUNCH_ASK,
+    "reply_edited": LAUNCH_ASK,
+    "later_reply_in_thread": ("Nothing launched. Someone wrote in the thread after the message you are answering. Read "
+                              "it and answer it, then ask whether to launch."),
+    "needs_confirmation": ("Nothing launched. The person's reply was not a plain yes to this run. Answer what they "
+                           "said; if they still want the run, ask them to confirm with a short yes."),
+    "ambiguous_proposal": ("Nothing launched. More than one proposed run is waiting in this thread, so a yes does not "
+                           "say which. Withdraw the proposals you replaced, then ask again."),
     "authorization_already_used": ("Nothing launched. That message already launched a run, and one message launches "
                                    "one run. Ask whether to launch this one as well."),
     "not_this_thread": ("Nothing launched. This run was proposed in another thread and can be launched only from "
@@ -1007,6 +1017,9 @@ def _refusal(proposal_id: str, body: Any) -> Dict[str, Any]:
         out["proposalStatus"] = body["status"]
     if isinstance(body.get("launched"), dict):
         out["launchedRun"] = body["launched"]
+    for key in ("reason", "estimatedDocCount", "currentDocCount"):
+        if body.get(key) is not None:
+            out[key] = body[key]
     out["next"] = LAUNCH_REFUSALS.get(code) or f"Nothing changed. {message}"
     return out
 
@@ -1020,8 +1033,18 @@ def _review_launch(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict
     if not current_acting_user():
         raise ValueError("A run can be launched only for the person who said yes in the thread, and this turn has "
                          "no lawyer on it.")
-    status, body = client.json_with_status("POST", f"/api/matters/{mid}/proposals/{proposal_id}/launch",
-                                           json_body={"threadId": thread_id}, ok_statuses=(404, 405, 409))
+    # The app-minted turn grant ties the launch to the post this turn answers; LitKit requires it.
+    grant = current_turn_grant()
+    try:
+        status, body = client.json_with_status("POST", f"/api/matters/{mid}/proposals/{proposal_id}/launch",
+                                               json_body={"threadId": thread_id}, ok_statuses=(404, 405, 409),
+                                               extra_headers={TURN_GRANT_HEADER: grant} if grant else None)
+    except LitKitPermissionError as exc:
+        if not str(exc.code or "").startswith("turn_grant"):
+            raise
+        return {"proposalId": proposal_id, "launched": False, "refused": exc.code,
+                "message": (exc.body or {}).get("message") if isinstance(exc.body, dict) else None,
+                "next": LAUNCH_NO_GRANT}
     if _route_missing(status, body):
         return {"proposalId": proposal_id, "launched": False, "message": LAUNCH_NOT_AVAILABLE,
                 "next": LAUNCH_NOT_AVAILABLE}
@@ -1613,7 +1636,7 @@ def litkit_cross_matter_search(args: Dict[str, Any]) -> Any:
     matter's text is written into this matter's home.
     """
     query = str(_require(args, "query"))
-    grant = current_turn_grant()
+    grant = current_cross_matter_grant()
     if not grant or not current_acting_user():
         return dumps({"available": False, "message": CROSS_MATTER_UNAVAILABLE})
     body: Dict[str, Any] = {"query": query[:1000]}
