@@ -145,13 +145,15 @@ def ndjson(rows: List[Dict[str, Any]]) -> Tuple[int, bytes, Dict[str, str]]:
 
 
 class FakeReview:
-    """LitKit's review-structure routes for one matter, with state: criteria sets and their versions,
-    work sets, ``review-jobs/propose`` with the review_run billing protocol, and accept-all-tags.
+    """LitKit's review-structure routes for one matter, with state, shaped as litkit-app answers them
+    (docs/plans/ana-review-contract.md and the route code): criteria sets and their versions (an edit is
+    a publish of the whole list from a base version; there is no PATCH), the matter's work sets,
+    ``review-jobs/propose`` with the review_run billing protocol, and accept-all-tags.
 
     Billing follows litkit-app's ``review_run``: with ``price_usd > 0``, a propose without a quoteId
     returns ``requiresApproval`` and a draft quote and proposes nothing; a propose with that quoteId
     and ``userConfirmed: true`` approves the quote and queues the proposal. A quoteId the person has
-    not approved answers 402."""
+    not approved is a 400 with a sentence in ``error``."""
 
     def __init__(self, fake: FakeLitKit, matter_id: str = MATTER_ID, *, price_usd: float = 0.0,
                  doc_count: int = 1234) -> None:
@@ -160,60 +162,92 @@ class FakeReview:
         self.sets: Dict[str, Dict[str, Any]] = {}
         self.quotes: Dict[str, str] = {}  # quote id -> draft | approved | consumed
         self.proposals: List[Dict[str, Any]] = []
-        self.work_sets = [{"id": "00000000-0000-4000-8000-00000000a001", "name": "Crowder emails", "docCount": 812}]
+        self.sets["builtin:privilege"] = {"id": "builtin:privilege", "scope": "firm", "name": "Privilege",
+                                          "builtIn": True, "currentVersion": 1, "versions": [{
+                                              "version": 1, "changeNote": "", "criteria": [{
+                                                  "title": "Privileged communications", "tagName": "Privileged"}]}]}
+        self.work_sets = [
+            {"id": "00000000-0000-4000-8000-00000000a001", "name": "Crowder emails", "status": "open",
+             "docCount": 812, "creator": {"id": USER_ID, "name": "Lawyer"},
+             "assignee": {"id": "00000000-0000-4000-8000-00000000b002", "name": "Reviewer"}},
+            {"id": "00000000-0000-4000-8000-00000000a002", "name": "Hot docs QC", "status": "open",
+             "docCount": 40, "creator": {"id": "00000000-0000-4000-8000-00000000b002", "name": "Reviewer"},
+             "assignee": {"id": USER_ID, "name": "Lawyer"}},
+            {"id": "00000000-0000-4000-8000-00000000a003", "name": "Unassigned", "status": "open",
+             "docCount": 5, "creator": {"id": "00000000-0000-4000-8000-00000000b003", "name": "Other"},
+             "assignee": None},
+        ]
         base = f"/api/matters/{matter_id}"
         sid = r"(?:[0-9a-f-]{36}|builtin:[a-z0-9_-]+)"
-        fake.route("GET", rf"{base}/criteria-sets", lambda r: {"matter": None, "mine": list(self.sets.values()),
-                                                                 "firm": [], "builtIn": []})
+        fake.route("GET", rf"{base}/criteria-sets", lambda r: {
+            "matter": None, "mine": [self._summary(s) for s in self.sets.values() if not s.get("builtIn")],
+            "firm": [], "builtIn": [self._summary(s) for s in self.sets.values() if s.get("builtIn")]})
         fake.route("POST", rf"{base}/criteria-sets", self._create)
         fake.route("GET", rf"{base}/criteria-sets/{sid}", lambda r: self._get(r.path.split("/")[-1]))
-        fake.route("PATCH", rf"{base}/criteria-sets/{sid}", self._update)
         fake.route("POST", rf"{base}/criteria-sets/{sid}/publish", self._publish)
         fake.route("GET", rf"{base}/criteria-sets/{sid}/versions",
-                   lambda r: self._with_set(r.path.split("/")[-2], lambda s: {"versions": s["versions"]}))
-        fake.route("GET", rf"{base}/work-sets", lambda r: {"workSets": self.work_sets})
+                   lambda r: self._with_set(r.path.split("/")[-2], lambda s: {"versions": [
+                       {k: v[k] for k in ("version", "changeNote")} for v in s["versions"]]}))
+        fake.route("GET", rf"{base}/work-sets", lambda r: {"sets": self.work_sets})
         fake.route("POST", rf"{base}/review-jobs/propose", self._propose)
         fake.route("POST", rf"{base}/review-jobs/[^/]+/accept-all-tags",
                    lambda r: {"ok": True, "accepted": 17, "jobId": r.path.split("/")[-2]})
+
+    @staticmethod
+    def _summary(s: Dict[str, Any]) -> Dict[str, Any]:
+        return {"id": s["id"], "scope": s["scope"], "name": s["name"], "currentVersion": s["currentVersion"],
+                "criteriaCount": len(s["versions"][-1]["criteria"])}
 
     def _with_set(self, set_id: str, fn: Callable[[Dict[str, Any]], Any]) -> Any:
         found = self.sets.get(set_id)
         return fn(found) if found else (404, {"error": "not_found"})
 
     def _get(self, set_id: str) -> Any:
-        return self._with_set(set_id, lambda s: {"set": {k: s[k] for k in ("id", "name", "currentVersion",
-                                                                            "publishedVersion")},
-                                                 "criteria": s["versions"][-1]["criteria"]})
+        return self._with_set(set_id, lambda s: {"set": self._summary(s), "version": s["currentVersion"],
+                                                 "criteria": s["versions"][-1]["criteria"],
+                                                 "unresolvedTagNames": []})
 
     def _create(self, req: Recorded) -> Any:
         body = req.json()
+        if body.get("scope") not in ("user", "firm") or not body.get("name") or not body.get("criteria"):
+            return 400, {"error": "invalid input", "details": {"scope": "Required"}}
         set_id = f"00000000-0000-4000-8000-{len(self.sets) + 1:012d}"
-        self.sets[set_id] = {"id": set_id, "name": body["name"], "currentVersion": 1, "publishedVersion": None,
+        self.sets[set_id] = {"id": set_id, "scope": body["scope"], "name": body["name"], "currentVersion": 1,
                              "versions": [{"version": 1, "criteria": body["criteria"], "changeNote": ""}]}
-        return 201, {"set": {"id": set_id, "name": body["name"], "currentVersion": 1}, "version": 1,
-                     "criteria": body["criteria"]}
+        return 201, {"set": {"id": set_id, "scope": body["scope"], "name": body["name"], "currentVersion": 1},
+                     "version": 1, "criteria": body["criteria"]}
 
-    def _update(self, req: Recorded) -> Any:
+    def _publish(self, req: Recorded) -> Any:
         body = req.json()
+        if not isinstance(body.get("criteria"), list) or not body["criteria"] \
+                or not isinstance(body.get("baseVersion"), int):
+            return 400, {"error": "invalid input", "details": {"criteria": "Required", "baseVersion": "Required"}}
 
-        def bump(s: Dict[str, Any]) -> Any:
+        def publish(s: Dict[str, Any]) -> Any:
+            current = s["versions"][-1]
+            if body["baseVersion"] != s["currentVersion"]:
+                return 409, {"error": "stale_version", "currentVersion": s["currentVersion"],
+                             "criteria": current["criteria"]}
+            if body["criteria"] == current["criteria"]:
+                return {"ok": True, "set": self._summary(s), "version": s["currentVersion"], "written": False,
+                        "criteria": current["criteria"]}
             s["currentVersion"] += 1
             s["versions"].append({"version": s["currentVersion"], "criteria": body["criteria"],
                                   "changeNote": body.get("changeNote", "")})
-            return {"set": {"id": s["id"], "currentVersion": s["currentVersion"]}, "version": s["currentVersion"]}
-        return self._with_set(req.path.split("/")[-1], bump)
-
-    def _publish(self, req: Recorded) -> Any:
-        def publish(s: Dict[str, Any]) -> Any:
-            s["publishedVersion"] = s["currentVersion"]
-            return {"ok": True, "set": {"id": s["id"]}, "version": s["currentVersion"]}
+            return {"ok": True, "set": self._summary(s), "version": s["currentVersion"], "written": True,
+                    "criteria": body["criteria"]}
         return self._with_set(req.path.split("/")[-2], publish)
 
     def _propose(self, req: Recorded) -> Any:
         body = req.json()
         set_id = body.get("criteriaSetId")
         if set_id and set_id not in self.sets:
-            return 404, {"error": "criteria_set_not_found"}
+            return 400, {"error": "criteriaSetId names no criteria set this person can see",
+                         "code": "criteria_set_not_found"}
+        rows = self.sets[set_id]["versions"][-1]["criteria"] if set_id else body.get("criteria") or []
+        row_tags = list(dict.fromkeys(r["tagName"] for r in rows if r.get("tagName")))
+        if body.get("tags") is not None and sorted(body["tags"]) != sorted(row_tags):
+            return 400, {"error": "tags must name exactly the criteria rows' tags", "code": "tags_mismatch"}
         quote_id = body.get("quoteId")
         if self.price_usd > 0:
             if not quote_id:
@@ -225,12 +259,18 @@ class FakeReview:
             if self.quotes.get(quote_id) == "draft" and body.get("userConfirmed") is True:
                 self.quotes[quote_id] = "approved"
             if self.quotes.get(quote_id) != "approved":
-                return 402, {"error": "quote_not_approved", "quoteId": quote_id}
+                return 400, {"error": "billing: the quote is not approved; ask the person and send userConfirmed"}
             self.quotes[quote_id] = "consumed"
-        proposal = {"proposalId": f"00000000-0000-4000-8000-{len(self.proposals) + 501:012d}",
-                    "estimatedCount": self.doc_count, "status": "pending",
-                    "estimate": {"amountEstUsd": self.price_usd, "docCount": self.doc_count},
-                    "criteriaSetVersion": self.sets[set_id]["currentVersion"] if set_id else None,
-                    "tags": body["tags"]}
+        proposal_id = f"00000000-0000-4000-8000-{len(self.proposals) + 501:012d}"
+        version = self.sets[set_id]["currentVersion"] if set_id else None
+        proposal = {"id": proposal_id, "kind": "review_run", "status": "pending",
+                    "name": body.get("name") or "Review & tag", "tags": body.get("tags") or row_tags, "newTags": [],
+                    "criteriaCount": len(rows),
+                    "criteriaSet": {"id": set_id, "name": self.sets[set_id]["name"],
+                                    "version": body.get("criteriaSetVersion") or version} if set_id else None,
+                    "tier": body.get("tier") or "fast", "autoApply": body.get("applyTags") is not False,
+                    "threadId": body.get("threadId"), "firstPass": None}
         self.proposals.append({**proposal, "request": body})
-        return proposal
+        return 201, {"proposed": True, "proposal": proposal, "estimatedDocCount": self.doc_count,
+                     "estimate": {"lane": "cloud", "totalUsd": self.price_usd}, "parallel": [],
+                     "postCardId": "00000000-0000-4000-8000-00000000c001" if body.get("threadId") else None}

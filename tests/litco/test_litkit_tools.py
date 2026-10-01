@@ -482,18 +482,19 @@ def test_review_structure_is_registered_then_proposed(fake, env):
                 criteria=CRITERIA, description="RFP set 2")
     set_id = made["set"]["id"]
     sent = fake.calls("POST", rf"/api/matters/{M}/criteria-sets")[-1].json()
-    assert sent == {"name": "Part 11 requests", "description": "RFP set 2",
+    # LitKit requires scope; Ana's sets belong to the acting person unless she says firm.
+    assert sent == {"scope": "user", "name": "Part 11 requests", "description": "RFP set 2",
                     "criteria": [CRITERIA[0], {"title": "Board materials"}]}
     assert call("litkit_review", action="criteria")["mine"][0]["id"] == set_id
     assert call("litkit_review", action="criteria", criteriaAction="get", criteriaSetId=set_id)["set"]["id"] == set_id
-    work_sets = call("litkit_review", action="work_sets")["workSets"]
+    work_sets = call("litkit_review", action="work_sets")["sets"]
     out = call("litkit_review", action="create", criteriaSetId=set_id, scope={"workSetId": work_sets[0]["id"]},
-               tags=["Pricing", "Board", "Pricing"], createMissingTags=True, name="Part 11 first pass")
-    assert out["proposalId"] and out["estimatedCount"] == 1234 and out["criteriaSetVersion"] == 1
-    assert "card in this thread" in out["next"] and "Review screen" in out["next"]
+               createMissingTags=True, name="Part 11 first pass")
+    assert out["proposed"] is True and out["estimatedDocCount"] == 1234
+    assert out["proposal"]["id"] and out["proposal"]["criteriaSet"]["version"] == 1
+    assert out["proposal"]["tags"] == ["Pricing"]
     assert review.proposals[0]["request"] == {"scope": {"workSetId": work_sets[0]["id"]}, "criteriaSetId": set_id,
-                                              "tags": ["Pricing", "Board"], "createMissingTags": True,
-                                              "name": "Part 11 first pass"}
+                                              "createMissingTags": True, "name": "Part 11 first pass"}
     req = fake.calls("POST", rf"/api/matters/{M}/review-jobs/propose")[-1]
     assert req.headers["x-litkit-acting-user"] == USER_ID
 
@@ -504,25 +505,92 @@ def test_review_criteria_change_is_a_new_version_then_reproposed(fake, env):
                   criteria=CRITERIA)["set"]["id"]
     added = CRITERIA + [{"title": "REV-NR", "tagName": "REV-NR", "description": "Part 11 item 6"}]
     out = call("litkit_review", action="criteria", criteriaAction="update", criteriaSetId=set_id, criteria=added,
-               changeNote="add REV-NR as Part 11 item 6", baseVersion=1)
-    assert out["version"] == 2
-    patch = fake.calls("PATCH", rf"/api/matters/{M}/criteria-sets/{set_id}")[-1].json()
-    assert patch["changeNote"] == "add REV-NR as Part 11 item 6" and patch["baseVersion"] == 1
-    assert patch["criteria"][-1] == {"title": "REV-NR", "tagName": "REV-NR", "description": "Part 11 item 6"}
-    assert call("litkit_review", action="criteria", criteriaAction="publish", criteriaSetId=set_id)["ok"] is True
-    assert fake.calls("POST", rf"/api/matters/{M}/criteria-sets/{set_id}/publish")[-1].json() == {}
+               changeNote="add REV-NR as Part 11 item 6")
+    assert out["version"] == 2 and out["written"] is True
+    # The edit is LitKit's publish: the whole list plus the version it edits, read from the set when not given.
+    publish = fake.calls("POST", rf"/api/matters/{M}/criteria-sets/{set_id}/publish")[-1].json()
+    assert publish["baseVersion"] == 1 and publish["changeNote"] == "add REV-NR as Part 11 item 6"
+    assert publish["criteria"][-1] == {"title": "REV-NR", "tagName": "REV-NR", "description": "Part 11 item 6"}
+    assert [r.method for r in fake.requests if "/criteria-sets/" in r.path] == ["GET", "POST"]
     versions = call("litkit_review", action="criteria", criteriaAction="versions", criteriaSetId=set_id)
     assert [v["version"] for v in versions["versions"]] == [1, 2]
     again = call("litkit_review", action="create", criteriaSetId=set_id, scope={"batesRange": {
         "start": " ABC0000001", "end": "ABC0004000"}}, tags=["Pricing", "REV-NR"])
-    assert again["criteriaSetVersion"] == 2
+    assert again["proposal"]["criteriaSet"]["version"] == 2
     assert review.proposals[-1]["request"]["scope"] == {"batesRange": {"start": "ABC0000001", "end": "ABC0004000"}}
+    assert not [r for r in fake.requests if r.method == "PATCH"]
+
+
+def test_review_criteria_update_from_a_stale_version_is_explained(fake, env):
+    FakeReview(fake)
+    set_id = call("litkit_review", action="criteria", criteriaAction="create", name="Part 11",
+                  criteria=CRITERIA)["set"]["id"]
+    call("litkit_review", action="criteria", criteriaAction="update", criteriaSetId=set_id,
+         criteria=CRITERIA + ["Someone else's row"], baseVersion=1)
+    stale = call("litkit_review", action="criteria", criteriaAction="update", criteriaSetId=set_id,
+                 criteria=CRITERIA + ["My row"], baseVersion=1)
+    assert stale["error"] == "stale_version" and stale["currentVersion"] == 2
+    assert stale["criteria"][-1] == {"title": "Someone else's row"}
+    assert "Merge into the returned criteria" in stale["next"]
+    same = call("litkit_review", action="criteria", criteriaAction="update", criteriaSetId=set_id,
+                criteria=stale["criteria"], baseVersion=2)
+    assert same["written"] is False and "Nothing changed" in same["next"]
+
+
+def test_review_criteria_publish_is_not_a_separate_step(fake, env):
+    FakeReview(fake)
+    enum = T.SCHEMAS["litkit_review"]["parameters"]["properties"]["criteriaAction"]["enum"]
+    assert "publish" not in enum and "update" in enum
+    set_id = call("litkit_review", action="criteria", criteriaAction="create", name="Part 11",
+                  criteria=CRITERIA)["set"]["id"]
+    n = len(fake.requests)
+    # A session that still asks for the old second step learns there is none; nothing is sent.
+    out = call("litkit_review", action="criteria", criteriaAction="publish", criteriaSetId=set_id)
+    assert out["sent"] is False and "no separate publish" in out["next"]
+    assert len(fake.requests) == n
+    # With criteria it is the edit it always meant.
+    out = call("litkit_review", action="criteria", criteriaAction="publish", criteriaSetId=set_id,
+               criteria=CRITERIA + ["Board minutes"])
+    assert out["version"] == 2
+
+
+def test_review_criteria_create_takes_a_firm_scope_and_refuses_others(fake, env):
+    FakeReview(fake)
+    call("litkit_review", action="criteria", criteriaAction="create", name="Firm privilege", criteria=CRITERIA,
+         setScope="firm")
+    assert fake.calls("POST", rf"/api/matters/{M}/criteria-sets")[-1].json()["scope"] == "firm"
+    n = len(fake.requests)
+    assert "setScope" in call("litkit_review", action="criteria", criteriaAction="create", name="x",
+                              criteria=CRITERIA, setScope="matter")["error"]
+    assert len(fake.requests) == n
+
+
+def test_review_create_passes_tier_rationale_notes_and_set_version(fake, env):
+    review = FakeReview(fake)
+    set_id = call("litkit_review", action="criteria", criteriaAction="create", name="Part 11",
+                  criteria=CRITERIA)["set"]["id"]
+    call("litkit_review", action="create", criteriaSetId=set_id, criteriaSetVersion=1, tier="high",
+         includeRationaleNotes=True, scope={"workSetId": _id(2)})
+    sent = review.proposals[-1]["request"]
+    assert sent["tier"] == "high" and sent["includeRationaleNotes"] is True and sent["criteriaSetVersion"] == 1
+    assert "tags" not in sent
+    for key in ("tier", "criteriaSetVersion"):
+        assert key in T.SCHEMAS["litkit_review"]["parameters"]["properties"]
+
+
+def test_review_create_tags_when_sent_must_match_the_rows(fake, env):
+    FakeReview(fake)
+    set_id = call("litkit_review", action="criteria", criteriaAction="create", name="Part 11",
+                  criteria=CRITERIA)["set"]["id"]
+    out = call("litkit_review", action="create", criteriaSetId=set_id, tags=["Pricing", "Hot"],
+               scope={"workSetId": _id(2)})
+    assert out["status"] == 400 and "exactly the criteria rows' tags" in out["error"]
 
 
 def test_review_create_billing_quote_then_confirm(fake, env):
     review = FakeReview(fake, price_usd=41.5)
-    base = {"action": "create", "criteria": CRITERIA, "tags": ["Pricing"],
-            "scope": {"filter": {"custodian": "Doe, Jane", "dateFrom": "2021-01-01"}}}
+    base = {"action": "create", "criteria": CRITERIA, "scope": {"filter": {"custodian": "Doe, Jane",
+                                                                           "dateFrom": "2021-01-01"}}}
     quoted = call("litkit_review", **base)
     assert quoted["requiresApproval"] is True and quoted["quote"]["amountEstUsd"] == 41.5
     assert "Nothing is proposed yet" in quoted["next"] and "quoteId=q1" in quoted["next"]
@@ -534,8 +602,11 @@ def test_review_create_billing_quote_then_confirm(fake, env):
     n = len(fake.requests)
     assert "quoteId" in call("litkit_review", **base, userConfirmed=True)["error"]
     assert len(fake.requests) == n
+    # A quote the person has not approved is LitKit's 400, with a sentence to act on.
+    refused = call("litkit_review", **base, quoteId="q1")
+    assert refused["status"] == 400 and "not approved" in refused["error"]
     done = call("litkit_review", **base, quoteId="q1", userConfirmed=True)
-    assert done["proposalId"] and "card in this thread" in done["next"]
+    assert done["proposed"] is True and done["proposal"]["id"]
     second = fake.calls("POST", rf"/api/matters/{M}/review-jobs/propose")[-1].json()
     assert second["quoteId"] == "q1" and second["userConfirmed"] is True
     assert review.quotes == {"q1": "consumed"} and len(review.proposals) == 1
@@ -587,10 +658,12 @@ def test_review_create_sends_the_turns_thread_as_thread_id(fake, env):
 def test_review_create_second_approver_is_explained(fake, env):
     fake.route("POST", rf"/api/matters/{M}/review-jobs/propose",
                {"proposed": False, "requiresApproval": True, "needsSecondApprover": True,
-                "quote": {"id": "q9", "amountEstUsd": 9000, "docCount": 90000}})
-    out = call("litkit_review", action="create", criteriaSetId="builtin:privilege", tags=["Privileged"],
+                "quote": {"id": "q9", "amountEstUsd": 9000, "docCount": 90000, "sku": "review_fast",
+                          "expiresAt": "2026-10-02T00:00:00Z"}})
+    out = call("litkit_review", action="create", criteriaSetId="builtin:privilege",
                scope={"documentIds": [_id(1)]}, quoteId="q9", userConfirmed=True)
-    assert "different matter admin" in out["next"] and "q9" in out["next"]
+    assert out["proposed"] is False and "different matter admin" in out["next"] and "q9" in out["next"]
+    assert "proposalId" not in out
 
 
 @pytest.mark.parametrize("args,message", [
@@ -610,7 +683,10 @@ def test_review_create_second_approver_is_explained(fake, env):
     ({"tags": ["P"], "criteria": [{"description": "no title"}], "scope": {"workSetId": _id(2)}}, "needs a title"),
     ({"tags": ["P"], "criteria": [{"title": "t", "disposition": "maybe"}], "scope": {"workSetId": _id(2)}},
      "disposition"),
-    ({"criteriaSetId": _id(1), "scope": {"workSetId": _id(2)}}, "'tags' must be a non-empty list"),
+    ({"tags": [], "criteriaSetId": _id(1), "scope": {"workSetId": _id(2)}}, "'tags' must be a non-empty list"),
+    ({"criteriaSetId": _id(1), "criteriaSetVersion": 0, "scope": {"workSetId": _id(2)}}, "criteriaSetVersion"),
+    ({"criteria": CRITERIA, "criteriaSetVersion": 2, "scope": {"workSetId": _id(2)}}, "goes with criteriaSetId"),
+    ({"criteriaSetId": _id(1), "tier": "turbo", "scope": {"workSetId": _id(2)}}, "'tier' must be one of"),
     ({"tags": [" "], "criteriaSetId": _id(1), "scope": {"workSetId": _id(2)}}, "at least one tag"),
     ({"tags": [f"t{i}" for i in range(26)], "criteriaSetId": _id(1), "scope": {"workSetId": _id(2)}}, "at most 25"),
 ])
@@ -626,6 +702,8 @@ def test_review_create_rejects_bad_arguments_before_any_request(fake, env, args,
     ({"criteriaAction": "get"}, "'criteriaSetId' is required"),
     ({"criteriaAction": "update", "criteriaSetId": _id(1)}, "non-empty list"),
     ({"criteriaAction": "publish", "criteriaSetId": "a/b"}, "criteria set id"),
+    ({"criteriaAction": "update", "criteriaSetId": _id(1), "criteria": CRITERIA, "baseVersion": "2"}, "baseVersion"),
+    ({"criteriaAction": "create", "name": "x", "criteria": CRITERIA, "setScope": "matter"}, "setScope"),
     ({"criteriaAction": "delete", "criteriaSetId": _id(1)}, "criteriaAction must be one of"),
 ])
 def test_review_criteria_rejects_bad_arguments_before_any_request(fake, env, args, message):
@@ -646,6 +724,34 @@ def test_review_accept_tags_and_unknown_actions(fake, env):
     assert "'jobId' is required" in call("litkit_review", action="accept_tags")["error"]
     assert "action must be one of" in call("litkit_review", action="launch", jobId="job1")["error"]
     assert len(fake.requests) == n
+
+
+def test_work_sets_list_reads_the_matters_sets(fake, env):
+    review = FakeReview(fake)
+    out = call("litkit_work_sets", action="list")
+    assert [w["id"] for w in out["sets"]] == [w["id"] for w in review.work_sets]
+    req = fake.calls("GET", rf"/api/matters/{M}/work-sets")[-1]
+    assert req.query == {} and req.headers["x-litkit-acting-user"] == USER_ID
+    assert not fake.calls("GET", r"/api/work-sets")
+
+
+@pytest.mark.parametrize("role,names", [("inbox", ["Hot docs QC"]), ("outbox", ["Crowder emails"])])
+def test_work_sets_role_filters_to_the_acting_lawyer(fake, env, role, names):
+    FakeReview(fake)
+    out = call("litkit_work_sets", action="list", role=role)
+    assert [w["name"] for w in out["sets"]] == names
+    assert fake.calls("GET", rf"/api/matters/{M}/work-sets")[-1].query == {}
+
+
+def test_work_sets_role_is_checked_before_any_request(fake, env):
+    FakeReview(fake)
+    assert "'role' must be one of" in call("litkit_work_sets", action="list", role="mine")["error"]
+    token = bind_turn(None)
+    try:
+        assert "needs a lawyer" in call("litkit_work_sets", action="list", role="inbox")["error"]
+    finally:
+        reset_turn(token)
+    assert fake.requests == []
 
 
 def test_review_create_permission_refusal_is_plain(fake, env):

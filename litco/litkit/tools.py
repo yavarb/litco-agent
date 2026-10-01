@@ -777,7 +777,10 @@ def litco_deliver_local(args: Dict[str, Any]) -> Any:
 
 REVIEW_ACTIONS = ("list", "status", "records", "resume", "cancel", "pause", "create", "criteria", "work_sets",
                   "accept_tags")
-CRITERIA_ACTIONS = ("list", "get", "create", "update", "publish", "versions")
+CRITERIA_ACTIONS = ("list", "get", "create", "update", "versions")
+CRITERIA_SET_SCOPES = ("user", "firm")
+REVIEW_TIERS = ("fast", "medium", "high")
+WORK_SET_ROLES = ("inbox", "outbox")
 CRITERION_KEYS = ("key", "title", "description", "seedQuery", "tagName", "tagId", "disposition")
 CRITERION_DISPOSITIONS = ("apply", "propose", "propose_with_ambiguous")
 SCOPE_KINDS = ("workSetId", "documentIds", "filter", "batesRange")
@@ -850,7 +853,8 @@ def _review_scope(value: Any) -> Dict[str, Any]:
 
 def _review_tags(value: Any) -> List[str]:
     if not isinstance(value, list) or not value:
-        raise ValueError("'tags' must be a non-empty list of tag names: the only tags the run may write")
+        raise ValueError("'tags' must be a non-empty list of tag names: the only tags the run may write (or leave "
+                         "it out: the criteria rows name the tags)")
     names = list(dict.fromkeys(str(t).strip() for t in value if str(t).strip()))
     if not names:
         raise ValueError("'tags' must name at least one tag")
@@ -898,12 +902,25 @@ def _review_create(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict
         raise ValueError("give exactly one of criteriaSetId (a registered set, preferred) or criteria")
     if has_set:
         body["criteriaSetId"] = _set_id(args)
+        if args.get("criteriaSetVersion") is not None:
+            version = args["criteriaSetVersion"]
+            if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+                raise ValueError("'criteriaSetVersion' must be a version number (1 or more)")
+            body["criteriaSetVersion"] = version
     else:
+        if args.get("criteriaSetVersion") is not None:
+            raise ValueError("'criteriaSetVersion' goes with criteriaSetId")
         body["criteria"] = _criteria(args.get("criteria"))
-    body["tags"] = _review_tags(args.get("tags"))
-    for key in ("createMissingTags", "applyTags"):
+    # The rows name the tags; when tags are sent, LitKit refuses a list that differs from the rows'.
+    if args.get("tags") is not None:
+        body["tags"] = _review_tags(args.get("tags"))
+    for key in ("createMissingTags", "applyTags", "includeRationaleNotes"):
         if args.get(key) is not None:
             body[key] = bool(args[key])
+    if args.get("tier") is not None:
+        if args["tier"] not in REVIEW_TIERS:
+            raise ValueError(f"'tier' must be one of {', '.join(REVIEW_TIERS)}")
+        body["tier"] = args["tier"]
     if args.get("name"):
         body["name"] = str(args["name"]).strip()[:200]
     # Omitted unless Ana sets it, so the server's default applies (on when Jev is configured).
@@ -949,33 +966,65 @@ def _review_create(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict
     return result
 
 
+def _criteria_update(client: LitKitClient, base: str, args: Dict[str, Any]) -> Any:
+    """A new version of a set: LitKit's publish takes the whole list and the version it edits."""
+    set_id = _set_id(args)
+    body: Dict[str, Any] = {"criteria": _criteria(args.get("criteria"))}
+    if args.get("baseVersion") is not None:
+        version = args["baseVersion"]
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("'baseVersion' must be the set's version number you edited")
+    else:
+        found = client.get(f"{base}/{set_id}")
+        version = (found.get("set") or {}).get("currentVersion") if isinstance(found, dict) else None
+        if not isinstance(version, int):
+            raise ValueError("LitKit did not report the set's current version; give baseVersion")
+    body["baseVersion"] = version
+    if args.get("changeNote"):
+        body["changeNote"] = str(args["changeNote"])[:500]
+    status, result = client.json_with_status("POST", f"{base}/{set_id}/publish", json_body=body,
+                                             ok_statuses=(409,))
+    result = result if isinstance(result, dict) else {"result": result}
+    if status == 409 and result.get("error") == "stale_version":
+        result["next"] = ("Someone published since that version. Merge into the returned criteria and update again "
+                          "from currentVersion.")
+    elif status == 409:
+        raise LitKitError(f"HTTP 409: {_error_text(result) or 'conflict'}", status=409, body=result)
+    elif result.get("written") is False:
+        result["next"] = "Nothing changed: these criteria are the current version's."
+    return result
+
+
 def _review_criteria(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Any:
     sub = str(args.get("criteriaAction") or "list")
     base = f"/api/matters/{mid}/criteria-sets"
     if sub == "list":
         return client.get(base)
+    if sub == "publish":
+        # Hosts before LitKit's 0288 sets published in a second step; sessions may still ask for it.
+        if args.get("criteria") is not None:
+            return _criteria_update(client, base, args)
+        _set_id(args)
+        return {"criteriaAction": "publish", "sent": False,
+                "next": "There is no separate publish step: create and update each publish a version. Nothing "
+                        "was sent."}
     if sub not in CRITERIA_ACTIONS:
         raise ValueError(f"criteriaAction must be one of {', '.join(CRITERIA_ACTIONS)}")
     if sub == "create":
-        body: Dict[str, Any] = {"name": str(_require(args, "name"))[:120], "criteria": _criteria(args.get("criteria"))}
+        scope = args.get("setScope") or "user"
+        if scope not in CRITERIA_SET_SCOPES:
+            raise ValueError(f"'setScope' must be one of {', '.join(CRITERIA_SET_SCOPES)}")
+        body: Dict[str, Any] = {"scope": scope, "name": str(_require(args, "name"))[:120],
+                                "criteria": _criteria(args.get("criteria"))}
         if args.get("description"):
             body["description"] = str(args["description"])[:500]
-        if args.get("setScope"):
-            body["scope"] = str(args["setScope"])
         return client.post(base, body)
+    if sub == "update":
+        return _criteria_update(client, base, args)
     set_id = _set_id(args)
     if sub == "get":
         return client.get(f"{base}/{set_id}")
-    if sub == "versions":
-        return client.get(f"{base}/{set_id}/versions")
-    extra: Dict[str, Any] = {}
-    if args.get("changeNote"):
-        extra["changeNote"] = str(args["changeNote"])[:500]
-    if args.get("baseVersion") is not None:
-        extra["baseVersion"] = int(args["baseVersion"])
-    if sub == "update":
-        return client.patch(f"{base}/{set_id}", {"criteria": _criteria(args.get("criteria")), **extra})
-    return client.post(f"{base}/{set_id}/publish", extra)
+    return client.get(f"{base}/{set_id}/versions")
 
 
 @_tool("litkit_review")
@@ -1117,7 +1166,19 @@ def litkit_work_sets(args: Dict[str, Any]) -> Any:
     mid = _mid(client)
     action = str(args.get("action") or "list")
     if action == "list":
-        return client.get("/api/work-sets", params={"matterId": mid, "role": args.get("role")})
+        # The matter's sets, whoever made or holds them. /api/work-sets is one person's inbox and outbox.
+        role = args.get("role") or None
+        if role is not None and role not in WORK_SET_ROLES:
+            raise ValueError(f"'role' must be one of {', '.join(WORK_SET_ROLES)}, or left out for every set")
+        user = current_acting_user()
+        if role and not user:
+            raise ValueError("'role' needs a lawyer on this turn; leave it out to list every set on the matter")
+        body = client.get(f"/api/matters/{mid}/work-sets")
+        if not role or not isinstance(body, dict) or not isinstance(body.get("sets"), list):
+            return body
+        key = "assignee" if role == "inbox" else "creator"
+        mine = [s for s in body["sets"] if isinstance(s, dict) and ((s.get(key) or {}).get("id") == user)]
+        return {**body, "sets": mine}
     if action == "get":
         return client.get(f"/api/work-sets/{_uuid(args, 'workSetId')}")
     if action == "create":
@@ -1590,16 +1651,23 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
                           "disposition": {"type": "string", "enum": list(CRITERION_DISPOSITIONS)}},
                           "required": ["title"]}},
          "name": {"type": "string", "description": "criteria set name (create), or the run's name"},
-         "description": _S, "changeNote": _S, "baseVersion": _I,
-         "setScope": {"type": "string", "description": "criteria set scope for criteriaAction=create, if LitKit asks"},
+         "description": _S, "changeNote": _S,
+         "baseVersion": {"type": "integer", "description": "criteriaAction=update: the version you edited (default: "
+                         "the current one)"},
+         "criteriaSetVersion": {"type": "integer", "description": "create: run this version of the set (default: "
+                                "current)"},
+         "tier": {"type": "string", "enum": list(REVIEW_TIERS), "description": "create: model tier (default fast)"},
+         "setScope": {"type": "string", "enum": list(CRITERIA_SET_SCOPES),
+                      "description": "criteriaAction=create: user (default, the person's own set) or firm"},
          "scope": {"type": "object", "description": "documents for create; exactly one of {workSetId}, "
                    "{documentIds:[..]}, {filter:{custodian, dateFrom, dateTo, query, tagIds, ...}}, "
                    "{batesRange:{start, end}}"},
          "tags": {"type": "array", "items": {"type": "string"},
-                  "description": "create: every tag name the run may write (only these can be applied)"},
-         "createMissingTags": _B, "applyTags": {"type": "boolean", "description": "omit for the server default "
-                                                "(tags apply; the person can pick suggest-only on the card); false "
-                                                "leaves them as proposals"},
+                  "description": "create: optional; the criteria rows name the tags. If sent, exactly the rows' "
+                                 "tags"},
+         "createMissingTags": _B, "applyTags": {"type": "boolean", "description": "create: tags apply unless false "
+                                                "(false leaves them as proposals). With criteriaSetId leave it out: "
+                                                "true is refused; set the rows' disposition instead"},
          "quoteId": {"type": "string", "description": "billing phase 2: the quote id from requiresApproval"},
          "userConfirmed": {"type": "boolean", "description": "billing phase 2: true only after the person said yes "
                            "to the quoted price"},
@@ -1634,9 +1702,12 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
          "kind": {"type": "string", "enum": ["issue", "privilege", "responsive", "custom"]}, "color": _S,
          "tagId": _S, "documentIds": _IDS, "scope": {"type": "string", "enum": ["doc", "attachments", "family"]}}),
     "litkit_work_sets": _schema(
-        "litkit_work_sets", "Work sets (document batches assigned to a reviewer): list, get, create, close, reopen.",
+        "litkit_work_sets", "Work sets (document batches assigned to a reviewer): list (every set on the matter), "
+        "get, create, close, reopen.",
         {"action": {"type": "string", "enum": ["list", "get", "create", "close", "reopen"]}, "workSetId": _S,
-         "assigneeId": _S, "name": _S, "message": _S, "documentIds": _IDS, "role": _S}),
+         "assigneeId": _S, "name": _S, "message": _S, "documentIds": _IDS,
+         "role": {"type": "string", "enum": list(WORK_SET_ROLES),
+                  "description": "list: only sets handed to (inbox) or made by (outbox) this lawyer"}}),
     "litkit_litlex": _schema(
         "litkit_litlex", "LitLex legal research: search, opinion (saved to litlex/), citator, authorities, "
         "statute, resolve citations, cite_check a quotation, brief_check a draft file.",
