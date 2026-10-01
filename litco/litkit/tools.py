@@ -775,8 +775,8 @@ def litco_deliver_local(args: Dict[str, Any]) -> Any:
 # review, ingest, proposals, tags, work sets
 # ---------------------------------------------------------------------------
 
-REVIEW_ACTIONS = ("list", "status", "records", "resume", "cancel", "pause", "create", "criteria", "work_sets",
-                  "accept_tags")
+REVIEW_ACTIONS = ("list", "status", "records", "resume", "cancel", "pause", "create", "launch", "withdraw",
+                  "proposal", "criteria", "work_sets", "accept_tags")
 CRITERIA_ACTIONS = ("list", "get", "create", "update", "versions")
 CRITERIA_SET_SCOPES = ("user", "firm")
 REVIEW_TIERS = ("fast", "medium", "high")
@@ -895,7 +895,8 @@ def _optimizations(value: Any) -> List[str]:
 
 
 def _review_create(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Propose a review run. LitKit queues a proposal card in the thread; a person launches it there."""
+    """Propose a review run. LitKit posts the proposal's card in the thread; Ana launches it (action=launch)
+    after the person says yes there."""
     body: Dict[str, Any] = {"scope": _review_scope(args.get("scope"))}
     has_set, has_criteria = bool(args.get("criteriaSetId")), args.get("criteria") is not None
     if has_set == has_criteria:
@@ -959,11 +960,122 @@ def _review_create(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict
                               "and ask whether to proceed. Only after an explicit yes, call create again with the "
                               f"same arguments plus quoteId={quote.get('id')} and userConfirmed=true.")
         return result
+    proposal = result.get("proposal") if isinstance(result.get("proposal"), dict) else {}
+    if proposal.get("id"):
+        result["proposalId"] = proposal["id"]
     result["next"] = ("Proposed, not launched. Tell the person what you proposed: the scope, the criteria set and "
-                      "version, the tags, the estimated document count and cost. Launch is on the card in this "
-                      "thread; that is their one decision. Do not send them to the Review screen to set it up. After "
-                      "they launch, follow the run with status and records and report when it finishes.")
+                      "version, the tags, the estimated document count and cost. Then ask whether to launch. When "
+                      "they answer yes in this thread, call action=launch with this proposalId. Do not launch in this "
+                      "turn; LitKit refuses until they have answered.")
+    if body.get("userConfirmed"):
+        # The person's yes to the price may already have told Ana to launch (Hermes ruling 4): one yes, not two.
+        result["next"] = ("Proposed, not launched. If the person's yes to the price also told you to launch this run, "
+                          "call action=launch with this proposalId now; LitKit decides from the thread whether that "
+                          "message covers the launch. Otherwise tell them what you proposed (scope, criteria set and "
+                          "version, tags, document count and cost) and ask whether to launch.")
     return result
+
+
+LAUNCH_NOT_AVAILABLE = ("This LitKit cannot take a launch from the conversation yet. The Launch button on the card "
+                        "in this thread starts the run.")
+LAUNCH_ASK = ("Nothing launched. Ask the person, in one sentence, whether to launch this run, and call launch only "
+              "after their answer in this thread says yes.")
+LAUNCH_REFUSALS = {
+    "no_reply_after_card": LAUNCH_ASK,
+    "reply_from_another_person": LAUNCH_ASK,
+    "authorization_already_used": ("Nothing launched. That message already launched a run, and one message launches "
+                                   "one run. Ask whether to launch this one as well."),
+    "not_this_thread": ("Nothing launched. This run was proposed in another thread and can be launched only from "
+                        "there. If the person wants it run from here, propose it again in this thread."),
+    "needs_reproposal": ("Nothing launched. The scope, criteria or tags changed since the person saw the estimate. "
+                         "Withdraw this proposal, propose again, report the new estimate, and ask."),
+}
+
+
+def _route_missing(status: int, body: Any) -> bool:
+    """An app that predates the route: 405, or a 404 that is not one of the route's own JSON answers."""
+    return status == 405 or (status == 404 and not (isinstance(body, dict) and body.get("error")))
+
+
+def _refusal(proposal_id: str, body: Any) -> Dict[str, Any]:
+    """A 409 from launch or withdraw: LitKit's sentence for the model, as a plain result, not an error."""
+    body = body if isinstance(body, dict) else {}
+    code = str(body.get("error") or "conflict")
+    message = body.get("message") or _error_text(body) or "LitKit refused (HTTP 409)"
+    out: Dict[str, Any] = {"proposalId": proposal_id, "refused": code, "message": message}
+    if body.get("status"):
+        out["proposalStatus"] = body["status"]
+    if isinstance(body.get("launched"), dict):
+        out["launchedRun"] = body["launched"]
+    out["next"] = LAUNCH_REFUSALS.get(code) or f"Nothing changed. {message}"
+    return out
+
+
+def _review_launch(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Launch a proposed run. LitKit decides from the thread whether the person said to; nothing here asserts it."""
+    proposal_id = _uuid(args, "proposalId")
+    thread_id = current_thread_id()
+    if not thread_id or not _UUID.match(thread_id):
+        raise ValueError("A run can be launched only from the thread it was proposed in.")
+    if not current_acting_user():
+        raise ValueError("A run can be launched only for the person who said yes in the thread, and this turn has "
+                         "no lawyer on it.")
+    status, body = client.json_with_status("POST", f"/api/matters/{mid}/proposals/{proposal_id}/launch",
+                                           json_body={"threadId": thread_id}, ok_statuses=(404, 405, 409))
+    if _route_missing(status, body):
+        return {"proposalId": proposal_id, "launched": False, "message": LAUNCH_NOT_AVAILABLE,
+                "next": LAUNCH_NOT_AVAILABLE}
+    if status == 404:
+        raise LitKitError(f"not found, or not visible to this user (HTTP 404: {_error_text(body)})", status=404,
+                          body=body)
+    if status == 409:
+        return {"launched": False, **_refusal(proposal_id, body)}
+    launched = body.get("launched") if isinstance(body, dict) and isinstance(body.get("launched"), dict) else {}
+    job_id = launched.get("reviewJobId")
+    if not job_id:
+        return {"proposalId": proposal_id, "launched": False, "result": body,
+                "next": "LitKit returned no job id, so nothing can be reported as launched. Check with "
+                        "action=proposal before saying anything about the run."}
+    already = bool(body.get("alreadyLaunched"))
+    out: Dict[str, Any] = {"proposalId": proposal_id, "launched": True, "reviewJobId": job_id,
+                           "scopeDocCount": launched.get("scopeDocCount")}
+    if already:
+        out["alreadyLaunched"] = True
+        out["next"] = ("This run was already launched; no second run started. Tell the person it is running, and "
+                       "follow it with status and records.")
+    else:
+        out["next"] = ("Launched. Tell the person the run started and how many documents it covers (this count is "
+                       "the one taken at launch). Follow it with status and records, and report when it finishes.")
+    return out
+
+
+def _review_withdraw(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Withdraw a pending proposal, so a later yes cannot launch a card that was replaced."""
+    proposal_id = _uuid(args, "proposalId")
+    status, body = client.json_with_status("POST", f"/api/matters/{mid}/proposals/{proposal_id}/withdraw",
+                                           json_body={}, ok_statuses=(404, 405, 409))
+    if _route_missing(status, body):
+        return {"proposalId": proposal_id, "withdrawn": False,
+                "next": "This LitKit cannot withdraw a proposal from the conversation yet. Tell the person which "
+                        "proposal replaces it."}
+    if status == 404:
+        raise LitKitError(f"not found, or not visible to this user (HTTP 404: {_error_text(body)})", status=404,
+                          body=body)
+    if status == 409:
+        return {"withdrawn": False, **_refusal(proposal_id, body)}
+    return {"proposalId": proposal_id, "withdrawn": True, "result": body}
+
+
+def _review_proposal(client: LitKitClient, mid: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """A proposal's status and, once launched, its job."""
+    proposal_id = _uuid(args, "proposalId")
+    body = client.get(f"/api/matters/{mid}/proposals/{proposal_id}")
+    row = body.get("proposal") if isinstance(body, dict) and isinstance(body.get("proposal"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    out = {"proposalId": proposal_id, "kind": row.get("kind"), "status": row.get("status"),
+           "launched": row.get("launched"), "name": payload.get("name"), "threadId": row.get("threadId"),
+           "createdAt": row.get("createdAt"), "reviewedAt": row.get("reviewedAt")}
+    return {k: v for k, v in out.items() if v is not None or k in ("status", "launched")}
 
 
 def _criteria_update(client: LitKitClient, base: str, args: Dict[str, Any]) -> Any:
@@ -1037,6 +1149,12 @@ def litkit_review(args: Dict[str, Any]) -> Any:
         return client.get(base, params={"status": args.get("status"), "limit": args.get("limit")})
     if action == "create":
         return _review_create(client, mid, args)
+    if action == "launch":
+        return _review_launch(client, mid, args)
+    if action == "withdraw":
+        return _review_withdraw(client, mid, args)
+    if action == "proposal":
+        return _review_proposal(client, mid, args)
     if action == "criteria":
         return _review_criteria(client, mid, args)
     if action == "work_sets":
@@ -1634,13 +1752,14 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
         "documents. Writes nothing to LitKit; findings saved to qa/.",
         {"path": _S, "text": _S, "deliverableClass": _S}),
     "litkit_review": _schema(
-        "litkit_review", "Review & Tag. To start a review, register it: tags (litkit_tags), criteria set "
-        "(action=criteria), scope, then create; the person launches it from the card in the thread. Never tell "
-        "them to set it up in the UI. requiresApproval: show the price; call again with quoteId and "
-        "userConfirmed=true only after a yes. Also list, status, records, resume/cancel/pause, work_sets, "
-        "accept_tags.",
+        "litkit_review", "Review & Tag. Register tags, criteria set "
+        "(action=criteria) and scope; create proposes. Report the estimate, ask whether to launch, and call "
+        "action=launch only after the person says yes in the thread. requiresApproval: quoteId and "
+        "userConfirmed=true only after a yes to the price. Also withdraw, proposal, list, status, records, "
+        "resume/cancel/pause, work_sets, accept_tags.",
         {"action": {"type": "string", "enum": list(REVIEW_ACTIONS)},
          "jobId": _S, "status": _S, "limit": _I,
+         "proposalId": {"type": "string", "description": "launch, withdraw, proposal: the id create returned"},
          "criteriaAction": {"type": "string", "enum": list(CRITERIA_ACTIONS),
                             "description": "with action=criteria (default list)"},
          "criteriaSetId": {"type": "string", "description": "a criteria set id (uuid) or builtin:<name>"},

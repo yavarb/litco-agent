@@ -606,7 +606,9 @@ def test_review_create_billing_quote_then_confirm(fake, env):
     refused = call("litkit_review", **base, quoteId="q1")
     assert refused["status"] == 400 and "not approved" in refused["error"]
     done = call("litkit_review", **base, quoteId="q1", userConfirmed=True)
-    assert done["proposed"] is True and done["proposal"]["id"]
+    assert done["proposed"] is True and done["proposalId"] == done["proposal"]["id"]
+    # A yes to the price that also said "launch it" is the one yes; LitKit judges the message, not the host.
+    assert "also told you to launch" in done["next"] and "action=launch" in done["next"]
     second = fake.calls("POST", rf"/api/matters/{M}/review-jobs/propose")[-1].json()
     assert second["quoteId"] == "q1" and second["userConfirmed"] is True
     assert review.quotes == {"q1": "consumed"} and len(review.proposals) == 1
@@ -722,8 +724,164 @@ def test_review_accept_tags_and_unknown_actions(fake, env):
     assert fake.requests[-1].json() == {}
     n = len(fake.requests)
     assert "'jobId' is required" in call("litkit_review", action="accept_tags")["error"]
-    assert "action must be one of" in call("litkit_review", action="launch", jobId="job1")["error"]
+    assert "action must be one of" in call("litkit_review", action="rerun", jobId="job1")["error"]
     assert len(fake.requests) == n
+
+
+# ---------------------------------------------------------------------------
+# launch from the conversation: Ana proposes, the person says yes in the thread, Ana launches.
+# LitKit decides from its own record of the thread whether they did; the host asserts nothing.
+
+THREAD = "7d0c6f2e-3a1b-4c5d-8e9f-0a1b2c3d4e5f"
+
+
+@pytest.fixture
+def in_thread(env):
+    token = bind_turn(TurnIdentity(turn_id="turn_t", matter_id=M, acting_user=USER_ID, cwd=env["cwd"],
+                                   thread_id=THREAD))
+    yield THREAD
+    reset_turn(token)
+
+
+def _proposed(fake, review):
+    set_id = call("litkit_review", action="criteria", criteriaAction="create", name="Part 11",
+                  criteria=CRITERIA)["set"]["id"]
+    return call("litkit_review", action="create", criteriaSetId=set_id, scope={"workSetId": review.work_sets[0]["id"]})
+
+
+def test_review_create_asks_then_launches_from_the_conversation(fake, in_thread):
+    review = FakeReview(fake)
+    out = _proposed(fake, review)
+    assert out["proposalId"] == out["proposal"]["id"] == review.proposals[0]["id"]
+    assert "action=launch" in out["next"] and "this proposalId" in out["next"]
+    assert "card" not in out["next"] and "Do not launch in this turn" in out["next"]
+
+
+def test_launch_before_the_person_answers_is_an_instruction_to_ask(fake, in_thread):
+    review = FakeReview(fake)
+    proposal_id = _proposed(fake, review)["proposalId"]
+    out = call("litkit_review", action="launch", proposalId=proposal_id)
+    assert "error" not in out and out["launched"] is False and out["refused"] == "no_reply_after_card"
+    assert out["message"].startswith("The person has not answered in this thread")
+    assert "Ask the person" in out["next"]
+    assert review.jobs == {} and review.proposals[0]["status"] == "pending"
+
+
+def test_launch_after_the_person_answers_starts_one_run(fake, in_thread):
+    review = FakeReview(fake)
+    proposal_id = _proposed(fake, review)["proposalId"]
+    review.reply(proposal_id)
+    out = call("litkit_review", action="launch", proposalId=proposal_id)
+    [job_id] = review.jobs
+    assert out == {"proposalId": proposal_id, "launched": True, "reviewJobId": job_id, "scopeDocCount": 1234,
+                   "next": out["next"]}
+    assert "how many documents it covers" in out["next"] and "status and records" in out["next"]
+    req = fake.calls("POST", rf"/api/matters/{M}/proposals/{proposal_id}/launch")[-1]
+    # The thread is the only thing the host says; no flag claims the person agreed.
+    assert req.json() == {"threadId": THREAD}
+    assert req.headers["x-litkit-acting-user"] == USER_ID and "x-litkit-user-assertion" in req.headers
+    again = call("litkit_review", action="launch", proposalId=proposal_id)
+    assert again["launched"] is True and again["alreadyLaunched"] is True and again["reviewJobId"] == job_id
+    assert "already launched" in again["next"] and len(review.jobs) == 1
+    assert call("litkit_review", action="proposal", proposalId=proposal_id) == {
+        "proposalId": proposal_id, "kind": "review_run", "status": "accepted",
+        "launched": {"reviewJobId": job_id, "scopeDocCount": 1234}, "name": "Review & tag", "threadId": THREAD,
+        "createdAt": "2026-10-01T12:00:00Z"}
+
+
+def test_a_full_review_runs_from_the_conversation_with_no_refused_call(fake, in_thread):
+    """Acceptance: register, propose, (the person answers), launch, follow; LitKit refuses nothing but the
+    one launch tried before the answer."""
+    review = FakeReview(fake)
+    fake.route("POST", r"/api/tags", lambda r: (201, {"tag": {"id": _id(77), "name": r.json()["name"]}}))
+    call("litkit_tags", action="create", name="Pricing", kind="issue")
+    set_id = call("litkit_review", action="criteria", criteriaAction="create", name="Part 11",
+                  criteria=CRITERIA)["set"]["id"]
+    call("litkit_review", action="criteria", criteriaAction="update", criteriaSetId=set_id,
+         criteria=CRITERIA + ["Board minutes"], changeNote="add board minutes")
+    ws = call("litkit_review", action="work_sets")["sets"][0]["id"]
+    proposal_id = call("litkit_review", action="create", criteriaSetId=set_id, scope={"workSetId": ws},
+                       tier="medium")["proposalId"]
+    assert call("litkit_review", action="launch", proposalId=proposal_id)["refused"] == "no_reply_after_card"
+    review.reply(proposal_id)
+    job_id = call("litkit_review", action="launch", proposalId=proposal_id)["reviewJobId"]
+    assert call("litkit_review", action="status", jobId=job_id)["job"]["status"] == "running"
+    assert call("litkit_review", action="records", jobId=job_id)["records"] == []
+    refused = [(r.method, r.path, r.status) for r in fake.requests if r.status >= 400]
+    assert refused == [("POST", f"/api/matters/{M}/proposals/{proposal_id}/launch", 409)]
+    assert not [r for r in fake.requests if r.method == "PATCH"]
+
+
+@pytest.mark.parametrize("code,expect", [
+    ("reply_from_another_person", "Ask the person"),
+    ("authorization_already_used", "one message launches one run"),
+    ("not_this_thread", "proposed in another thread"),
+    ("needs_reproposal", "Withdraw this proposal, propose again"),
+    ("not_a_launch_instruction", "Nothing changed. Their message did not tell you to launch."),
+])
+def test_launch_refusals_carry_litkits_sentence(fake, in_thread, code, expect):
+    message = "Their message did not tell you to launch." if code == "not_a_launch_instruction" else f"m:{code}"
+    fake.route("POST", rf"/api/matters/{M}/proposals/{_id(5)}/launch", (409, {"error": code, "message": message}))
+    out = call("litkit_review", action="launch", proposalId=_id(5))
+    assert "error" not in out and out["launched"] is False and out["refused"] == code
+    assert out["message"] == message and expect in out["next"]
+
+
+def test_launch_on_an_app_without_the_route_points_to_the_card(fake, in_thread):
+    review = FakeReview(fake)
+    proposal_id = _proposed(fake, review)["proposalId"]
+    review.reply(proposal_id)
+    review.launch_route = False
+    out = call("litkit_review", action="launch", proposalId=proposal_id)
+    assert out["launched"] is False and "error" not in out
+    assert out["message"] == T.LAUNCH_NOT_AVAILABLE and "Launch button on the card" in out["message"]
+    fake.route("POST", rf"/api/matters/{M}/proposals/{proposal_id}/launch", (405, ""))
+    assert call("litkit_review", action="launch", proposalId=proposal_id)["message"] == T.LAUNCH_NOT_AVAILABLE
+    assert review.jobs == {}
+
+
+def test_launch_of_an_unknown_proposal_is_not_found(fake, in_thread):
+    FakeReview(fake)
+    out = call("litkit_review", action="launch", proposalId=_id(404))
+    assert out["status"] == 404 and "not found" in out["error"]
+
+
+def test_launch_refusal_for_permission_stays_plain(fake, in_thread):
+    fake.route("POST", rf"/api/matters/{M}/proposals/{_id(5)}/launch", (403, {"error": "forbidden"}))
+    out = call("litkit_review", action="launch", proposalId=_id(5))
+    assert out["permission_denied"] is True and out["error"].startswith("not permitted")
+
+
+@pytest.mark.parametrize("identity,args,message", [
+    ({"thread_id": None}, {"proposalId": _id(5)}, "only from the thread it was proposed in"),
+    ({"thread_id": "C0123:1712.5"}, {"proposalId": _id(5)}, "only from the thread it was proposed in"),
+    ({"thread_id": THREAD, "acting_user": None}, {"proposalId": _id(5)}, "no lawyer on it"),
+    ({"thread_id": THREAD}, {}, "'proposalId' is required"),
+    ({"thread_id": THREAD}, {"proposalId": "../review-jobs"}, "uuid"),
+])
+def test_launch_is_refused_before_any_request(fake, env, identity, args, message):
+    turn = {"turn_id": "t", "matter_id": M, "acting_user": USER_ID, "cwd": env["cwd"], **identity}
+    token = bind_turn(TurnIdentity(**turn))
+    try:
+        out = call("litkit_review", action="launch", **args)
+    finally:
+        reset_turn(token)
+    assert message in out["error"]
+    assert fake.requests == []
+
+
+def test_withdraw_replaces_a_card_so_a_later_yes_cannot_launch_it(fake, in_thread):
+    review = FakeReview(fake)
+    old = _proposed(fake, review)["proposalId"]
+    out = call("litkit_review", action="withdraw", proposalId=old)
+    assert out["withdrawn"] is True and review.proposals[0]["status"] == "rejected"
+    review.reply(old)
+    late = call("litkit_review", action="launch", proposalId=old)
+    assert late["launched"] is False and late["proposalStatus"] == "rejected" and review.jobs == {}
+    again = call("litkit_review", action="withdraw", proposalId=old)
+    assert again["withdrawn"] is False and "error" not in again
+    review.launch_route = False
+    assert call("litkit_review", action="withdraw", proposalId=old)["withdrawn"] is False
 
 
 def test_work_sets_list_reads_the_matters_sets(fake, env):
