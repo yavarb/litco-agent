@@ -174,7 +174,12 @@ The assertion is minted fresh for each request and each retry (MAC = base64url, 
 
 ### Errors and retries
 
-- 401 and 403 raise `LitKitPermissionError` and come back to the model as `{"error": "not permitted for this user on this matter (…)", "status": 403, "permission_denied": true}`. They are never retried.
+- 401 and 403 raise `LitKitPermissionError` and are never retried. The client classifies each refusal by whom it is about and gives the model one `message` and one `next` for it (`refusal_kind` and `explain_refusal` in `litco/litkit/client.py`, the only place that text lives):
+  - `person`: a 403 with the lawyer's assertion on the request. The lawyer may not see or do this; Ana tells them. Only this class carries `"permission_denied": true` and the error `not permitted for this user on this matter (…)`.
+  - `platform`: a 403 that gates the agent host itself (`mfa_required`, `agent_token_forbidden`, `agent_token_required`, `acting_user_required`), or any 403 with no lawyer on the turn. Ana reports a LitKit limit on that tool and offers another path; she never asks the person to sign in, enroll MFA or fix their account.
+  - `host`: a 401, `agent_token_matter_mismatch`, or an assertion error. The LitCo operator fixes the host; the person is not involved.
+  - `litkit_error`: a 5xx. Ana retries once, then reports it.
+- When LitKit refuses the batch text export (`POST …/export/text`) with a 403 that is not `host`, `litkit_export_text` and `litkit_jev screen` read each document through `GET /api/documents/{id}` and `…/text` instead (`litco/litkit/doc_text.py`), as the lawyer on the turn. The result says so (`textRoute: "per-document"`, `batchRouteRefused`, `fallbackNote`). `litkit_export_text` covers 500 documents per call this way and reports `remaining`.
 - Reads (`GET`, and the read-only POSTs: bulk text export, quote checks, LitLex cite checks) retry on 429, 500, 502, 503 and 504 with exponential backoff (four retries, `Retry-After` honored). Writes retry only on 429, 503, or a connection that never opened, so a deliverable or a proposal is never committed twice.
 - 404 reads as "not found, or not visible to this user"; LitKit hides walled documents as missing.
 - The token and the host secret never appear in logs, reprs, or error text.

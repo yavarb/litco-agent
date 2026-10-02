@@ -15,7 +15,8 @@ from litco.litkit import jev as J
 from litco.litkit import tools as T
 from litco.litkit.client import LitKitClient, LitKitConfig, set_default_client
 from litco.litkit.context import TurnIdentity, bind_turn, reset_turn
-from tests.litco._litkit_fake import HOST_SECRET, MATTER_ID, TOKEN, USER_ID, FakeLitKit, FakeReview, ndjson
+from tests.litco._litkit_fake import (HOST_SECRET, MATTER_ID, MFA_REQUIRED, TOKEN, USER_ID, FakeLitKit, FakeReview,
+                                     documents, ndjson)
 
 M = MATTER_ID
 KEY = "ts_test_key_123"
@@ -143,6 +144,26 @@ def test_screen_sends_one_fanned_out_request_per_document_and_culls_in_code(fake
     # Text came through LitKit's ACL-scoped export, as the acting lawyer.
     export = fake.calls("POST", rf"/api/matters/{M}/export/text")
     assert len(export) == 1 and export[0].headers["x-litkit-acting-user"] == USER_ID
+
+
+def test_screen_runs_on_per_document_text_when_litkit_refuses_the_batch_export(fake, jev):
+    """Regression for the Adobe host, 2026-10-02: export/text answered 403 mfa_required to the agent token, and
+    Ana told the lawyer to fix their MFA. The per-document text route answers, so the first pass still runs."""
+    fake.route("POST", rf"/api/matters/{M}/export/text", MFA_REQUIRED)
+    documents(fake, {_id(1): ("ABC001", "pricing email"), _id(2): ("ABC002", "lunch order")})
+    jev.probs = {"ABC001": {"responsive": 0.91, "c_0": 0.88},
+                 "ABC002": {"responsive": 0.02, "c_0": 0.01, "c_1": 0.03, "privileged_signal": 0.02}}
+    out = call("litkit_jev", action="screen", documentIds=[_id(1), _id(2), _id(3)], criteria=CRITERIA)
+
+    assert (out["screened"], out["read_in_full"], out["set_aside"], out["not_found"]) == (3, 1, 1, 1)
+    assert out["textRoute"] == "per-document" and out["batchRouteRefused"]["code"] == "mfa_required"
+    assert "refused" in out["fallbackNote"] and "per-document" not in out.get("error", "")
+    assert "your " not in out["fallbackNote"].lower() and "permission_denied" not in out
+    assert {r["bates"] for r in out["rows"] if r.get("bates")} == {"ABC001", "ABC002"}
+    assert len(jev.requests) == 2
+    reads = fake.calls("GET", r"/api/documents/.*")
+    assert {r.path for r in reads} >= {f"/api/documents/{_id(1)}/text", f"/api/documents/{_id(2)}/text"}
+    assert all(r.headers.get("x-litkit-acting-user") == USER_ID for r in reads)
 
 
 def test_screen_saves_every_probability_and_reports_cost(fake, jev, env):
