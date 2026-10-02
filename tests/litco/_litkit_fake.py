@@ -362,3 +362,23 @@ class FakeReview:
                          "message": f"This proposal is {p['status']}; only a pending proposal can be withdrawn."}
         p["status"] = "rejected"
         return {"ok": True, "status": "rejected"}
+
+
+# What LitKit answered the Adobe host on 2026-10-02 for the batch text export: a gate on the agent token.
+MFA_REQUIRED = (403, {"error": "mfa_required"})
+
+
+def documents(fake: FakeLitKit, docs: Dict[str, Tuple[str, str]]) -> None:
+    """The per-document routes ``GET /api/documents/{id}`` and ``…/text`` for ``docs = {id: (bates, text)}``;
+    an id not in ``docs`` answers 404, as a missing or walled document does."""
+    def find(req: Recorded, text: bool) -> Any:
+        doc_id = req.path.split("/")[3]
+        if doc_id not in docs:
+            return 404, {"error": "not found"}
+        bates, body = docs[doc_id]
+        if text:
+            return {"chunks": [], "extractedText": body}
+        return {"doc": {"id": doc_id, "batesStart": bates, "batesEnd": bates, "custodian": "Doe, Jane",
+                        "documentDate": "2024-03-01", "subject": "s"}}
+    fake.route("GET", r"/api/documents/[0-9a-f-]{36}", lambda r: find(r, False))
+    fake.route("GET", r"/api/documents/[0-9a-f-]{36}/text", lambda r: find(r, True))

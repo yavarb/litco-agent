@@ -109,17 +109,46 @@ def test_retries_exhaust_to_an_honest_error(fake, client):
     assert info.value.status == 502 and len(fake.calls("GET", r"/api/down")) == 4
 
 
-@pytest.mark.parametrize("status,code", [(401, "unauthorized"), (403, "forbidden"),
-                                         (403, "agent_token_matter_mismatch")])
-def test_401_403_surface_as_permission_errors_and_are_never_retried(fake, client, status, code):
+# Who a refusal is about decides what the model is told. Regression for the Adobe host, 2026-10-02:
+# a 403 mfa_required on the agent token became "enroll MFA, sign out and in" homework for the lawyer.
+@pytest.mark.parametrize("status,code,acting,kind", [
+    (403, "forbidden", True, "person"),
+    (403, "mfa_required", True, "platform"),
+    (403, "agent_token_forbidden", True, "platform"),
+    (403, "forbidden", False, "platform"),  # no lawyer on the turn: LitKit judged the agent's own role
+    (401, "unauthorized", True, "host"),
+    (403, "agent_token_matter_mismatch", True, "host"),
+    (403, "assertion_expired", True, "host"),
+])
+def test_refusals_say_whom_they_are_about_and_are_never_retried(fake, client, status, code, acting, kind):
     fake.route("GET", r"/api/secret", (status, {"error": code}))
     with pytest.raises(LitKitPermissionError) as info:
-        client.get("/api/secret")
+        if acting:
+            with turn_scope(TurnIdentity(acting_user=USER_ID)):
+                client.get("/api/secret")
+        else:
+            client.get("/api/secret")
     err = info.value
-    assert PERMISSION_MESSAGE in str(err) and err.status == status and err.code == code
-    assert err.to_dict()["permission_denied"] is True
+    assert err.status == status and err.code == code and err.kind == kind
+    out = err.to_dict("litkit_tags")
+    assert out["refusal"] == kind and out["message"] and "`litkit_tags`" in out["message"] + out["next"]
+    # Only the person's own refusal reads as the person's: permission_denied and "for this user".
+    assert out.get("permission_denied", False) is (kind == "person")
+    assert (PERMISSION_MESSAGE in str(err)) is (kind == "person")
+    if kind != "person":
+        told = (out["error"] + " " + out["message"] + " " + out["next"]).lower()
+        assert "for this user" not in told and "your " not in told and "identity" not in out["message"].lower()
     assert len(fake.calls("GET", r"/api/secret")) == 1
     assert client.sleeps == []
+
+
+def test_a_server_error_says_retry_once_then_report_it_as_litkits(fake, client):
+    fake.route("POST", r"/api/w", (500, {"error": "boom"}))
+    with pytest.raises(LitKitError) as info:
+        client.post("/api/w", {})
+    out = info.value.to_dict("litkit_tags")
+    assert out["refusal"] == "litkit_error" and "permission_denied" not in out
+    assert "once" in out["next"] and "LitKit error" in out["next"] and "`litkit_tags`" in out["next"]
 
 
 def test_token_and_secret_never_leak(fake, client, caplog):

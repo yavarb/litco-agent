@@ -12,7 +12,8 @@ import pytest
 from litco.litkit import tools as T
 from litco.litkit.client import LitKitClient, LitKitConfig, set_default_client
 from litco.litkit.context import TurnIdentity, bind_turn, current_turn, reset_turn
-from tests.litco._litkit_fake import HOST_SECRET, MATTER_ID, TOKEN, USER_ID, FakeLitKit, FakeReview, ndjson
+from tests.litco._litkit_fake import (HOST_SECRET, MATTER_ID, MFA_REQUIRED, TOKEN, USER_ID, FakeLitKit, FakeReview,
+                                     documents, ndjson)
 
 M = MATTER_ID
 
@@ -165,6 +166,48 @@ def test_export_text_batches_ndjson_into_texts_and_resumes(fake, env):
     out2 = call("litkit_export_text", documentIds=ids)
     assert out2["skippedExisting"] == 1201 and out2["batches"] == 1
     assert fake.calls("POST", rf"/api/matters/{M}/export/text")[-1].json()["docIds"] == [_id(7)]
+
+
+def test_export_text_falls_back_to_per_document_text_when_litkit_refuses_the_batch(fake, env, monkeypatch):
+    """Regression for the Adobe host, 2026-10-02: the batch export answered 403 mfa_required to the agent
+    token while the per-document text route answered 200."""
+    monkeypatch.setattr(T, "TEXT_FALLBACK_MAX", 3)
+    ids = [_id(i) for i in range(1, 6)]
+    fake.route("POST", rf"/api/matters/{M}/export/text", MFA_REQUIRED)
+    documents(fake, {d: (f"ABC{i:04d}", f"body of {i}") for i, d in enumerate(ids, 1) if i != 2})
+    out = call("litkit_export_text", documentIds=ids)
+    assert out["textRoute"] == "per-document" and out["batchRouteRefused"]["code"] == "mfa_required"
+    assert (out["written"], out["notFound"], out["remaining"]) == (2, 1, 2)
+    assert "slower" in out["fallbackNote"] and "again" in out["fallbackNote"] and "permission_denied" not in out
+    saved = (env["cwd"] / "texts" / "ABC0001.txt").read_text()
+    assert f"GET /api/documents/{_id(1)}/text" in saved and saved.endswith("body of 1")
+    # Every per-document read went out as the lawyer on the turn, including those on worker threads.
+    reads = fake.calls("GET", r"/api/documents/.*")
+    assert reads and all(r.headers.get("x-litkit-acting-user") == USER_ID for r in reads)
+    # The rerun the note asks for picks up where the first call stopped.
+    out2 = call("litkit_export_text", documentIds=ids)
+    assert out2["skippedExisting"] == 2 and out2["written"] == 2 and out2["remaining"] == 0
+    assert sorted(p.name for p in (env["cwd"] / "texts").glob("*.txt")) == ["ABC0001.txt", "ABC0003.txt",
+                                                                           "ABC0004.txt", "ABC0005.txt"]
+
+
+def test_export_text_does_not_fall_back_when_the_host_credentials_are_rejected(fake, env):
+    fake.route("POST", rf"/api/matters/{M}/export/text", (401, {"error": "unauthorized"}))
+    documents(fake, {_id(1): ("ABC0001", "x")})
+    out = call("litkit_export_text", documentIds=[_id(1)])
+    assert out["refusal"] == "host" and "LitCo" in out["next"] and fake.calls("GET", r"/api/documents/.*") == []
+
+
+@pytest.mark.parametrize("answer,kind", [(MFA_REQUIRED, "platform"), ((403, {"error": "forbidden"}), "person"),
+                                         ((401, {"error": "unauthorized"}), "host")])
+def test_a_tool_refusal_reports_what_litkit_said_about_the_agents_action(fake, env, answer, kind):
+    """A platform gate or a host misconfiguration is never handed to the lawyer as account homework."""
+    fake.route("GET", r"/api/tags", answer)
+    out = call("litkit_tags", action="list")
+    assert out["refusal"] == kind and "`litkit_tags`" in out["message"] + out["next"]
+    assert out.get("permission_denied", False) is (kind == "person")
+    if kind != "person":
+        assert "your " not in (out["message"] + out["next"]).lower()
 
 
 def test_text_saves_self_citing_file(fake, env):

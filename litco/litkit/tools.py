@@ -2,8 +2,9 @@
 
 Every tool calls LitKit through :class:`litco.litkit.client.LitKitClient`, which sends the
 matter-pinned agent token and, during a turn, the acting lawyer's user assertion. What the
-lawyer may not do, the tool may not do: a 401/403 comes back as a plain
-``not permitted for this user on this matter`` result, never retried and never worked around.
+lawyer may not do, the tool may not do: a 401/403 is never retried and never worked around, and
+it comes back with the client's ``message`` and ``next`` for whom it is about (the person, a
+LitKit limit on the agent host, or this host's configuration; see :func:`explain_refusal`).
 
 Results are concise JSON. Anything large (search hit lists, census pages, gate findings) is
 spilled to a file under the turn's working directory with a preview, following Hermes's
@@ -29,6 +30,8 @@ from litco.litkit.client import (TURN_GRANT_HEADER, LitKitClient, LitKitConfig, 
                                  LitKitPermissionError, default_client)
 from litco.litkit.context import (current_acting_user, current_cross_matter_grant, current_thread_id, current_turn,
                                   current_turn_grant)
+from litco.litkit.doc_text import (TEXT_FALLBACK_MAX, batch_refusal_note, batch_text_refused, date_of, metadata,
+                                   text_from_payload, texts_one_by_one)
 from litco.litkit.links import document_link, file_link, folder_link
 from litco.litkit.files import (TEXT_SEPARATOR, InputFileMissing, PathOutsideWorkDir, dumps, generate_preview,
                                 input_path, output_dir, output_path, relative, spill, work_dir)
@@ -90,10 +93,8 @@ def _tool(name: str) -> Callable[[Callable[..., Any]], Callable[..., str]]:
             args = args if isinstance(args, dict) else {}
             try:
                 result = fn(args)
-            except LitKitPermissionError as exc:
-                return dumps(exc.to_dict())
             except LitKitError as exc:
-                return dumps(exc.to_dict())
+                return dumps(exc.to_dict(name))
             except PathOutsideWorkDir as exc:
                 return _fail(str(exc))
             except InputFileMissing as exc:
@@ -157,13 +158,6 @@ def _doc_label(doc: Dict[str, Any]) -> str:
 
 def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _date_of(row: Dict[str, Any]) -> Optional[str]:
-    for key in ("date", "documentDate", "dateSent", "dateCreated", "dateModified"):
-        if row.get(key):
-            return str(row[key])
-    return None
 
 
 def _cap_list(items: Any, n: int = 20) -> Any:
@@ -373,12 +367,6 @@ def _resolve_doc_id(client: LitKitClient, args: Dict[str, Any]) -> str:
     return str(doc_id)
 
 
-def _metadata(client: LitKitClient, doc_id: str) -> Dict[str, Any]:
-    body = client.get(f"/api/documents/{doc_id}")
-    doc = body.get("doc") if isinstance(body, dict) else None
-    return doc if isinstance(doc, dict) else {}
-
-
 @_tool("litkit_document")
 def litkit_document(args: Dict[str, Any]) -> Any:
     client = _client()
@@ -394,37 +382,16 @@ def litkit_document(args: Dict[str, Any]) -> Any:
     return _linked(result, "link", document_link, _mid(client), doc_id, _doc_label(raw))
 
 
-def _text_from_payload(body: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
-    chunks = body.get("chunks") if isinstance(body.get("chunks"), list) else []
-    if chunks:
-        parts: List[str] = []
-        last_page = None
-        for ch in chunks:
-            if not isinstance(ch, dict):
-                continue
-            page = ch.get("pageStart")
-            if page is not None and page != last_page:
-                parts.append(f"[page {page}]")
-                last_page = page
-            parts.append(str(ch.get("text") or ""))
-        return "\n\n".join(parts), None
-    text = str(body.get("extractedText") or "")
-    capped = body.get("extractedTextCapped")
-    trunc = ({"served": capped.get("servedLength"), "full": capped.get("fullLength")}
-             if isinstance(capped, dict) else None)
-    return text, trunc
-
-
 @_tool("litkit_text")
 def litkit_text(args: Dict[str, Any]) -> Any:
     client = _client()
     mid = _mid(client)
     doc_id = _resolve_doc_id(client, args)
-    meta = _metadata(client, doc_id)
+    meta = metadata(client, doc_id)
     body = client.get(f"/api/documents/{doc_id}/text")
-    text, trunc = _text_from_payload(body if isinstance(body, dict) else {})
+    text, trunc = text_from_payload(body if isinstance(body, dict) else {})
     header = text_header(doc_id=doc_id, bates_start=meta.get("batesStart"), bates_end=meta.get("batesEnd"),
-                         custodian=meta.get("custodian"), date=_date_of(meta), author=meta.get("author"),
+                         custodian=meta.get("custodian"), date=date_of(meta), author=meta.get("author"),
                          subject=meta.get("subject"), file_name=meta.get("fileName"), matter_id=mid,
                          route=f"GET /api/documents/{doc_id}/text", truncated=trunc)
     target = output_path(args.get("dir") or "texts", text_filename(meta.get("batesStart"), doc_id))
@@ -446,7 +413,7 @@ def litkit_pdf(args: Dict[str, Any]) -> Any:
     doc_id = _resolve_doc_id(client, args)
     native = bool(args.get("native"))
     try:
-        meta = _metadata(client, doc_id)
+        meta = metadata(client, doc_id)
     except LitKitError:
         meta = {}
     stem = safe_segment(meta.get("batesStart") or doc_id)
@@ -506,38 +473,62 @@ def litkit_export_text(args: Dict[str, Any]) -> Any:
     stats = {"requested": len(ids), "skippedExisting": len(ids) - len(todo), "written": 0, "notFound": 0,
              "truncated": 0, "empty": 0, "errors": 0, "batches": 0}
     not_found: List[str] = []
+    batch_route = f"POST /api/matters/{mid}/export/text"
+
+    def store(line: Dict[str, Any]) -> None:
+        doc_id = line.get("docId")
+        if line.get("error"):
+            if line["error"] == "not_found" and doc_id:
+                stats["notFound"] += 1
+                not_found.append(str(doc_id))
+            else:
+                stats["errors"] += 1
+            return
+        if not doc_id:
+            return
+        text = str(line.get("text") or "")
+        trunc = {"served": len(text), "full": line.get("fullLength")} if line.get("truncated") else None
+        name = text_filename(line.get("batesStart"), str(doc_id))
+        header = text_header(doc_id=str(doc_id), bates_start=line.get("batesStart"), bates_end=line.get("batesEnd"),
+                             custodian=line.get("custodian"), date=line.get("date"), matter_id=mid,
+                             route=line.get("route") or batch_route, truncated=trunc)
+        (folder / name).write_text(header + text, encoding="utf-8")
+        index[str(doc_id)] = {"file": name, "bates": line.get("batesStart"), "batesEnd": line.get("batesEnd"),
+                              "custodian": line.get("custodian"), "date": line.get("date"),
+                              "textLen": len(text), **({"truncated": True} if trunc else {})}
+        stats["written"] += 1
+        stats["truncated"] += 1 if trunc else 0
+        stats["empty"] += 0 if text.strip() else 1
+
+    refused: Optional[LitKitError] = None
+    start = 0
     for start in range(0, len(todo), EXPORT_BATCH):
-        batch = todo[start:start + EXPORT_BATCH]
+        try:
+            for line in client.stream_ndjson("POST", f"/api/matters/{mid}/export/text",
+                                             json_body={"docIds": todo[start:start + EXPORT_BATCH]}, timeout=600):
+                store(line)
+        except LitKitPermissionError as exc:
+            if not batch_text_refused(exc):
+                raise
+            refused = exc
+            break
         stats["batches"] += 1
-        for line in client.stream_ndjson("POST", f"/api/matters/{mid}/export/text", json_body={"docIds": batch},
-                                         timeout=600):
-            doc_id = line.get("docId")
-            if line.get("error"):
-                if line["error"] == "not_found" and doc_id:
-                    stats["notFound"] += 1
-                    not_found.append(str(doc_id))
-                else:
-                    stats["errors"] += 1
-                continue
-            if not doc_id:
-                continue
-            text = str(line.get("text") or "")
-            trunc = {"served": len(text), "full": line.get("fullLength")} if line.get("truncated") else None
-            name = text_filename(line.get("batesStart"), str(doc_id))
-            header = text_header(doc_id=str(doc_id), bates_start=line.get("batesStart"),
-                                 bates_end=line.get("batesEnd"), custodian=line.get("custodian"),
-                                 date=line.get("date"), matter_id=mid,
-                                 route=f"POST /api/matters/{mid}/export/text", truncated=trunc)
-            (folder / name).write_text(header + text, encoding="utf-8")
-            index[str(doc_id)] = {"file": name, "bates": line.get("batesStart"), "batesEnd": line.get("batesEnd"),
-                                  "custodian": line.get("custodian"), "date": line.get("date"),
-                                  "textLen": len(text), **({"truncated": True} if trunc else {})}
-            stats["written"] += 1
-            stats["truncated"] += 1 if trunc else 0
-            stats["empty"] += 0 if text.strip() else 1
         _write_index(folder, index)  # after every batch, so an interrupted run resumes
+    remaining = 0
+    if refused is not None:
+        rest = todo[start:]
+        for row in texts_one_by_one(client, rest[:TEXT_FALLBACK_MAX]).values():
+            store(row)
+        remaining = max(0, len(rest) - TEXT_FALLBACK_MAX)
     _write_index(folder, index)
     result: Dict[str, Any] = {"dir": relative(folder), "index": relative(folder / "index.json"), **stats}
+    if refused is not None:
+        result.update(batch_refusal_note(refused, mid, "litkit_export_text"))
+        result["remaining"] = remaining
+        if remaining:
+            result["fallbackNote"] += (f" This call covered {TEXT_FALLBACK_MAX} documents; run litkit_export_text "
+                                       f"again with the same arguments for the other {remaining:,} (documents "
+                                       "already on disk are skipped).")
     if not_found:
         result["notFoundIds"] = _cap_list(not_found, 10)
     if stats["empty"]:
@@ -1650,9 +1641,9 @@ def litkit_cross_matter_search(args: Dict[str, Any]) -> Any:
         status, result = client.json_with_status("POST", CROSS_MATTER_ROUTE, json_body=body, ok_statuses=(404,),
                                                  extra_headers={TURN_GRANT_HEADER: grant})
     except LitKitPermissionError as exc:
-        out = exc.to_dict()
+        out = exc.to_dict("litkit_cross_matter_search")
         if "grant" in str(exc.code or "").lower():
-            out["message"] = CROSS_MATTER_UNAVAILABLE
+            out["message"] = out["next"] = CROSS_MATTER_UNAVAILABLE
         return dumps(out)
     if status == 404:
         return dumps({"available": False, "message": "Searching other matters is not available on this LitKit yet."})

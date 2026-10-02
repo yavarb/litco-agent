@@ -35,7 +35,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
-from litco.litkit.client import _secret
+from litco.litkit.client import LitKitPermissionError, _secret
+from litco.litkit.doc_text import (batch_refusal_note, batch_text_refused, date_of, metadata, text_from_payload,
+                                   texts_one_by_one)
 from litco.litkit.files import relative
 
 logger = logging.getLogger("litco.litkit.jev")
@@ -419,15 +421,22 @@ def _screen_criteria(client: Any, mid: str, args: Dict[str, Any]) -> List[Dict[s
     return criteria
 
 
-def _export_texts(client: Any, mid: str, ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Text and Bates metadata per document through LitKit's ACL-scoped export (one call, <= 500 ids)."""
+def _export_texts(client: Any, mid: str, ids: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Text and Bates metadata per document through LitKit's ACL-scoped export (one call, <= 500 ids), and
+    what the result must say about the route. If LitKit refuses the batch export, each document is read
+    through the per-document text route instead, so the screen still runs."""
     rows: Dict[str, Dict[str, Any]] = {}
-    for line in client.stream_ndjson("POST", f"/api/matters/{mid}/export/text", json_body={"docIds": ids},
-                                     timeout=600):
-        doc_id = str(line.get("docId") or "")
-        if doc_id:
-            rows[doc_id] = line
-    return rows
+    try:
+        for line in client.stream_ndjson("POST", f"/api/matters/{mid}/export/text", json_body={"docIds": ids},
+                                         timeout=600):
+            doc_id = str(line.get("docId") or "")
+            if doc_id:
+                rows[doc_id] = line
+    except LitKitPermissionError as exc:
+        if not batch_text_refused(exc):
+            raise
+        return texts_one_by_one(client, ids), batch_refusal_note(exc, mid, "litkit_jev")
+    return rows, {}
 
 
 def _meta(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -467,7 +476,7 @@ def screen(args: Dict[str, Any], jev: JevClient) -> Dict[str, Any]:
     document_state({}, "", questions)  # criteria too long for Jev fail here, before any request
     cids = [c["id"] for c in criteria]
     titles = {c["id"]: c["title"] for c in criteria}
-    texts = _export_texts(client, mid, ids)
+    texts, route_note = _export_texts(client, mid, ids)
 
     def one(doc_id: str) -> Dict[str, Any]:
         row = texts.get(doc_id)
@@ -533,6 +542,7 @@ def screen(args: Dict[str, Any], jev: JevClient) -> Dict[str, Any]:
                            "note": ("Set aside means not read yet, not non-responsive: Jev's numbers are a screen, "
                                     "never a finding. Read the uncertain ones in full. Documents with no text, "
                                     "not found, or an error were not screened.")}
+    out.update(route_note)
     if counts["not_found"]:
         out["notFoundNote"] = ("not found means LitKit returned no text for that id: it is not in this matter or "
                                "this lawyer may not see it")
@@ -590,13 +600,13 @@ def ask(args: Dict[str, Any], jev: JevClient) -> Dict[str, Any]:
                 raise ValueError("ask reads one document: give one documentId or one Bates number")
             bates = bates[0]
         doc_id = T._resolve_doc_id(client, {"documentId": args.get("documentId"), "bates": bates})
-        doc = T._metadata(client, doc_id)
+        doc = metadata(client, doc_id)
         body = client.get(f"/api/documents/{doc_id}/text")
-        text, trunc = T._text_from_payload(body if isinstance(body, dict) else {})
+        text, trunc = text_from_payload(body if isinstance(body, dict) else {})
         if not text.strip():
             return {"docId": doc_id, "bates": doc.get("batesStart"), "answers": None,
                     "note": "LitKit holds no extracted text for this document, so Jev cannot read it."}
-        meta = {"bates": doc.get("batesStart"), "custodian": doc.get("custodian"), "date": T._date_of(doc),
+        meta = {"bates": doc.get("batesStart"), "custodian": doc.get("custodian"), "date": date_of(doc),
                 "author": doc.get("author"), "subject": doc.get("subject"), "fileName": doc.get("fileName")}
         base = {"docId": doc_id, "bates": doc.get("batesStart")}
         capped = bool(trunc)

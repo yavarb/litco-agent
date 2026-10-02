@@ -13,11 +13,16 @@ Authentication (LitKit agent-token lane):
   minted a grant for the turn (FIRM_AGENT_HOST 6.3).
 * No ``Origin`` header is sent.
 
-Errors are honest: 401/403 raise :class:`LitKitPermissionError` ("not permitted for this
-user on this matter") and are never retried. 429 and 5xx are retried with exponential
-backoff for reads; writes are retried only where the server cannot have acted (429, 503,
-or a connection that never opened). The token and the host secret never appear in logs,
-reprs, or error messages.
+Errors are honest: 401/403 raise :class:`LitKitPermissionError` and are never retried. 429
+and 5xx are retried with exponential backoff for reads; writes are retried only where the
+server cannot have acted (429, 503, or a connection that never opened). The token and the
+host secret never appear in logs, reprs, or error messages.
+
+Every refusal and server error is classified by whom it is about (:func:`refusal_kind`), and
+:meth:`LitKitError.to_dict` gives the model one ``message`` and one ``next`` for that class
+(:func:`explain_refusal`). This is the only place that text lives. A LitKit gate on the agent
+host itself (``mfa_required`` on an agent-token request) is never the person's to fix: the
+person never signs in, enrolls MFA or changes a setting for the agent.
 """
 
 from __future__ import annotations
@@ -47,6 +52,21 @@ TOKEN_PREFIX = "lkm_"
 RETRY_STATUSES_READ = frozenset({429, 500, 502, 503, 504})
 RETRY_STATUSES_WRITE = frozenset({429, 503})
 PERMISSION_MESSAGE = "not permitted for this user on this matter"
+PLATFORM_MESSAGE = "LitKit refused this action for the agent host"
+HOST_MESSAGE = "LitKit rejected this agent host's credentials"
+
+# Who a refusal is about. The person: the lawyer on the turn may not see or do this. The
+# platform: LitKit gates the agent host itself, whoever is on the turn. The host: this host's
+# token or assertion is wrong, which the LitCo operator fixes. LitKit: the server failed.
+REFUSAL_PERSON = "person"
+REFUSAL_PLATFORM = "platform"
+REFUSAL_HOST = "host"
+REFUSAL_LITKIT = "litkit_error"
+# Every request carries the agent token, so these 403s gate the agent host, never the person.
+_PLATFORM_CODES = frozenset({"mfa_required", "agent_token_forbidden", "agent_token_required",
+                             "acting_user_required"})
+_HOST_CODES = frozenset({"agent_token_matter_mismatch", "user_assertion_required", "acting_user_invalid",
+                         "acting_user_not_found", "acting_user_is_service"})
 
 _CURRENT = object()  # sentinel: "use the current turn's acting user"
 
@@ -55,19 +75,65 @@ _CURRENT = object()  # sentinel: "use the current turn's acting user"
 # errors
 # ---------------------------------------------------------------------------
 
+def refusal_kind(status: int, code: Optional[str], *, acting: bool) -> Optional[str]:
+    """Whom a failed request is about; ``None`` for answers that are not refusals or server errors."""
+    code = str(code or "")
+    if status == 401 or code in _HOST_CODES or code.startswith("assertion_"):
+        return REFUSAL_HOST
+    if status == 403:
+        # Without a lawyer on the turn, LitKit judged the Matter Agent user, not a person.
+        return REFUSAL_PLATFORM if code in _PLATFORM_CODES or not acting else REFUSAL_PERSON
+    if status >= 500:
+        return REFUSAL_LITKIT
+    return None
+
+
+def explain_refusal(kind: str, *, tool: Optional[str] = None, status: int = 0,
+                    code: Optional[str] = None) -> Tuple[str, str]:
+    """``(message, next)`` for the model: what LitKit said about the agent's action, and the step the agent takes."""
+    name = f"`{tool}`" if tool else "this call"
+    said = code or f"HTTP {status}"
+    never = ("Never ask the person to sign in, enroll MFA, refresh a session, check their settings, or otherwise "
+             "fix their LitKit account, and never describe this as about their session or identity.")
+    if kind == REFUSAL_PLATFORM:
+        return (f"LitKit refused {name} for the agent host ({said}). This is a limit LitKit places on the agent; "
+                "nothing about the person's sign-in or account is involved.",
+                f"Report it as a LitKit limit on {name} and offer the other path: a narrower request, another "
+                "litkit_* tool that does the job, or a review run. If none fits, say LitCo needs to fix this and "
+                f"that you have noted it. {never}")
+    if kind == REFUSAL_HOST:
+        return (f"LitKit rejected this agent host's credentials on {name} ({said}). The LitCo operator fixes "
+                "this; the person is not involved.",
+                f"Tell the person LitCo needs to fix the agent host's connection to LitKit and that you have "
+                f"noted it. {never} Do not look for credentials.")
+    if kind == REFUSAL_PERSON:
+        return (f"LitKit says the person on this turn may not see or do what {name} asked ({said}).",
+                "Tell the person plainly that their LitKit access does not cover this and that a matter admin "
+                "can grant it. Do not try another route.")
+    return (f"LitKit failed on {name} ({said}).",
+            f"Retry {name} once, with a smaller request if it was large. If it fails again, report it as a "
+            "LitKit error on that tool, quoting this message, and say what you will do instead.")
+
+
 class LitKitError(Exception):
-    """A LitKit call failed. ``status`` is the HTTP status (0 for transport failures)."""
+    """A LitKit call failed. ``status`` is the HTTP status (0 for transport failures); ``acting`` says
+    whether a lawyer's assertion went with the request."""
 
     def __init__(self, message: str, *, status: int = 0, code: Optional[str] = None,
-                 body: Any = None, method: str = "", path: str = ""):
+                 body: Any = None, method: str = "", path: str = "", acting: bool = False):
         super().__init__(message)
         self.status = status
         self.code = code
         self.body = body
         self.method = method
         self.path = path
+        self.acting = acting
 
-    def to_dict(self) -> Dict[str, Any]:
+    @property
+    def kind(self) -> Optional[str]:
+        return refusal_kind(self.status, self.code, acting=self.acting)
+
+    def to_dict(self, tool: Optional[str] = None) -> Dict[str, Any]:
         out: Dict[str, Any] = {"error": str(self), "status": self.status}
         if self.code:
             out["code"] = self.code
@@ -75,15 +141,21 @@ class LitKitError(Exception):
             for key in ("errorKind", "token", "detail"):
                 if key in self.body and key not in out:
                     out[key] = self.body[key]
+        kind = self.kind
+        if kind:
+            out["refusal"] = kind
+            out["message"], out["next"] = explain_refusal(kind, tool=tool, status=self.status, code=self.code)
         return out
 
 
 class LitKitPermissionError(LitKitError):
-    """401 or 403: the acting user (or the Matter Agent user) may not do this on this matter."""
+    """401 or 403. :attr:`kind` says whether the person, the platform, or this host's configuration
+    is refused; only the person's refusal is ``permission_denied``."""
 
-    def to_dict(self) -> Dict[str, Any]:
-        out = super().to_dict()
-        out["permission_denied"] = True
+    def to_dict(self, tool: Optional[str] = None) -> Dict[str, Any]:
+        out = super().to_dict(tool)
+        if self.kind == REFUSAL_PERSON:
+            out["permission_denied"] = True
         return out
 
 
@@ -257,19 +329,23 @@ class LitKitClient:
         base = min(self.backoff_max, self.backoff_base * (2 ** attempt))
         return base * (0.75 + random.random() * 0.5)
 
-    def _raise_for(self, resp: httpx.Response, method: str, path: str) -> None:
+    def _raise_for(self, resp: httpx.Response, method: str, path: str, *, acting: bool = False) -> None:
         body = _parse_body(resp)
         code = _error_code(body)
         status = resp.status_code
         if status in (401, 403):
-            detail = f" ({code})" if code else ""
+            detail = f" (HTTP {status}{': ' + code if code else ''})"
+            kind = refusal_kind(status, code, acting=acting)
             if code == "agent_token_matter_mismatch":
-                msg = f"{PERMISSION_MESSAGE}: the agent token is pinned to a different matter{detail}"
-            elif code == "mfa_required":
-                msg = f"{PERMISSION_MESSAGE}: LitKit requires MFA for this identity{detail}"
+                msg = f"{HOST_MESSAGE}: the agent token is pinned to a different matter{detail}"
+            elif kind == REFUSAL_HOST:
+                msg = f"{HOST_MESSAGE}{detail}"
+            elif kind == REFUSAL_PLATFORM:
+                msg = f"{PLATFORM_MESSAGE}{detail}"
             else:
                 msg = f"{PERMISSION_MESSAGE}{detail}"
-            raise LitKitPermissionError(msg, status=status, code=code, body=body, method=method, path=path)
+            raise LitKitPermissionError(msg, status=status, code=code, body=body, method=method, path=path,
+                                        acting=acting)
         if status == 404:
             msg = f"not found, or not visible to this user (HTTP 404{': ' + code if code else ''})"
         elif status == 504:
@@ -280,7 +356,7 @@ class LitKitClient:
             msg = f"LitKit server error (HTTP {status}{': ' + code if code else ''})"
         else:
             msg = f"HTTP {status}{': ' + code if code else ''}"
-        raise LitKitError(msg, status=status, code=code, body=body, method=method, path=path)
+        raise LitKitError(msg, status=status, code=code, body=body, method=method, path=path, acting=acting)
 
     def _send(self, method: str, path: str, *, params: Optional[Mapping[str, Any]] = None, json_body: Any = None,
               files: Any = None, data: Optional[Mapping[str, Any]] = None, acting_user: Any = _CURRENT,
@@ -336,7 +412,7 @@ class LitKitClient:
             try:
                 if stream:
                     resp.read()
-                self._raise_for(resp, method, path)
+                self._raise_for(resp, method, path, acting=ACTING_USER_HEADER in headers)
             finally:
                 resp.close()
 
